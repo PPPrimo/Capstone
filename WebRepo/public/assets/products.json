@@ -1,0 +1,25 @@
+{
+  "products": [
+    {
+      "id": "p1",
+      "name": "Sample Widget",
+      "price": 19.99,
+      "images": [
+        {"url": "/assets/sample1.jpg", "description": "Front view", "priority": 2},
+        {"url": "/assets/sample2.jpg", "description": "Side view", "priority": 1},
+        {"url": "/assets/sample3.jpg"}
+      ],
+      "description": "A versatile sample widget for demonstration purposes."
+    },
+    {
+      "id": "p2",
+      "name": "Demo Gadget",
+      "price": 29.5,
+      "images": [
+        {"url": "/assets/gadget1.jpg", "description": "Overview", "priority": 3},
+        {"url": "/assets/gadget2.jpg"}
+      ],
+      "description": "An example gadget showcasing the product page layout."
+    }
+  ]
+}

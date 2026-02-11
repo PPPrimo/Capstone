@@ -1,0 +1,8 @@
+{
+  "dragBackStrength": 0.05,
+  "limitEasingStrength": 0.6,
+  "snapBackSpeed": 0.18,
+  "pixelToRad": 0.0025,
+  "rotateLimitDeg": 0,
+  "verticalOffsetDeg": 0
+}

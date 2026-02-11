@@ -1,0 +1,8 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.9
+cryptography>=43.0.0
+fastapi-users[sqlalchemy]>=15.0.0
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0
