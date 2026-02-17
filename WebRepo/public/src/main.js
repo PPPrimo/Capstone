@@ -1,16 +1,31 @@
-// Simple tab switching (no auth; production should restrict admin)
+// Simple tab switching + admin gate for Feature 3
 const tabs = document.querySelectorAll('.tab');
 const frame = document.getElementById('panelFrame');
+
+const tabMap = {
+  feature1: './feature1.html',
+  feature2: './feature2.html',
+  feature3: './feature3.html',
+};
 
 tabs.forEach(t => {
   t.addEventListener('click', () => {
     tabs.forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    const map = {
-      feature1: './feature1.html',
-      feature2: './feature2.html',
-      feature3: './feature3.html',
-    };
-    frame.setAttribute('src', map[t.dataset.tab]);
+    frame.setAttribute('src', tabMap[t.dataset.tab]);
   });
 });
+
+// Hide admin-only tabs until we confirm the user is a superuser
+(async () => {
+  try {
+    const res = await fetch('/api/me', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const me = await res.json();
+    if (!me.is_superuser) {
+      tabs.forEach(t => {
+        if (t.dataset.tab === 'feature3') t.style.display = 'none';
+      });
+    }
+  } catch (_) { /* leave tabs visible on network error */ }
+})();
