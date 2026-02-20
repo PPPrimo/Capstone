@@ -4,6 +4,7 @@
 # Ignore local Python virtual environment folder (this workspace has a venv in Capstone/)
 /Capstone/
 /.vscode/
+/ResearchFiles
 # Optional: common Python/OS noise (kept minimal)
 __pycache__/
 *.py[cod]
