@@ -1,5 +1,4 @@
 # Ignore vendored / external repos
-/lerobot/
 /ReferencedRepo/
 
 # Ignore local Python virtual environment folder (this workspace has a venv in Capstone/)
