@@ -81,7 +81,7 @@ Cloudflare tunnel
 running python
     sudo nano /etc/systemd/system/webrepo.service
     sudo systemctl daemon-reload
-    sudo systemctl reset0fauked webrepo
+    sudo systemctl reset-failed webrepo
     sudo systemctl start webrepo
 Running linux tunnel
     sudo cloudflared service install

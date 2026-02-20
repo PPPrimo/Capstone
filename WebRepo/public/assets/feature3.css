@@ -247,6 +247,45 @@ body.fit-viewport {
   font-size: 0.78rem;
   color: #888;
 }
+.range-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.range-label {
+  font-size: 0.78rem;
+  color: #555;
+  min-width: 42px;
+  text-align: right;
+  white-space: nowrap;
+}
+.range-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 120px;
+  height: 4px;
+  border-radius: 2px;
+  background: #ddd;
+  outline: none;
+  cursor: pointer;
+}
+.range-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #007aff;
+  cursor: pointer;
+}
+.range-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #007aff;
+  border: none;
+  cursor: pointer;
+}
 .charts-wrap {
   margin-top: 12px;
 }

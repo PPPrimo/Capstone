@@ -60,6 +60,10 @@
       <div class="history-header">
         <button id="btnToggleHistory" class="btn-history">Show History</button>
         <button id="btnClearHistory" class="btn-history btn-history-clear" style="display:none">Clear History</button>
+        <div id="rangeWrap" class="range-wrap" style="display:none">
+          <label for="rangeSlider" class="range-label" id="rangeLabel">All</label>
+          <input id="rangeSlider" type="range" min="0" max="8" value="8" class="range-slider" />
+        </div>
         <span id="historyInfo" class="history-info"></span>
       </div>
       <div id="chartsWrap" class="charts-wrap" style="display:none"></div>
@@ -92,10 +96,33 @@
       const diskGrid  = document.getElementById('diskGrid');
       const errBox    = document.getElementById('statsError');
 
-      const btnToggle  = document.getElementById('btnToggleHistory');
-      const btnClear   = document.getElementById('btnClearHistory');
-      const chartsWrap = document.getElementById('chartsWrap');
-      const hInfo      = document.getElementById('historyInfo');
+      const btnToggle   = document.getElementById('btnToggleHistory');
+      const btnClear    = document.getElementById('btnClearHistory');
+      const chartsWrap  = document.getElementById('chartsWrap');
+      const hInfo       = document.getElementById('historyInfo');
+      const rangeWrap   = document.getElementById('rangeWrap');
+      const rangeSlider = document.getElementById('rangeSlider');
+      const rangeLabel  = document.getElementById('rangeLabel');
+
+      /* Time-range presets (in ms); last entry = show all */
+      const RANGE_PRESETS = [
+        { label: '5 min',  ms: 5 * 60000 },
+        { label: '15 min', ms: 15 * 60000 },
+        { label: '30 min', ms: 30 * 60000 },
+        { label: '1 hr',   ms: 60 * 60000 },
+        { label: '2 hr',   ms: 2 * 3600000 },
+        { label: '6 hr',   ms: 6 * 3600000 },
+        { label: '12 hr',  ms: 12 * 3600000 },
+        { label: '24 hr',  ms: 24 * 3600000 },
+        { label: 'All',    ms: Infinity },
+      ];
+      function filterHistory(hist) {
+        const preset = RANGE_PRESETS[parseInt(rangeSlider.value, 10)] || RANGE_PRESETS[RANGE_PRESETS.length - 1];
+        rangeLabel.textContent = preset.label;
+        if (!hist.length || preset.ms === Infinity) return hist;
+        const cutoff = Date.now() - preset.ms;
+        return hist.filter(e => e.t >= cutoff);
+      }
 
       let chartVisible = false;
       // Track disk card elements keyed by mountpoint
@@ -307,29 +334,48 @@
           ctx.fillText(d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0'), x, H - 6);
         }
 
-        // Line
-        ctx.beginPath();
+        // Line & Fill — break at gaps larger than the expected sample spacing
+        const step = hist.length > 1500 ? Math.floor(hist.length / 1500) : 1;
+        const GAP_THRESH = POLL_MS * step * 1.5;
+
+        // Build segments: arrays of {x, y} split by gaps or null values
+        const segments = [];
+        let seg = [];
+        let prevT = null;
+        for (let i = 0; i < hist.length; i += step) {
+          const v = cfg.getValue(hist[i]);
+          if (v == null) {
+            if (seg.length) { segments.push(seg); seg = []; }
+            prevT = null;
+            continue;
+          }
+          const t = hist[i].t;
+          const x = PAD_L + ((t - tMin) / tSpan) * plotW;
+          const y = PAD_T + plotH - (Math.min(v, yMax) / yMax) * plotH;
+          if (prevT != null && (t - prevT) > GAP_THRESH) {
+            if (seg.length) { segments.push(seg); seg = []; }
+          }
+          seg.push({ x, y });
+          prevT = t;
+        }
+        if (seg.length) segments.push(seg);
+
+        // Draw each segment's stroke and fill independently
+        const baseY = PAD_T + plotH;
         ctx.strokeStyle = cfg.color.line;
         ctx.lineWidth = 1.5;
         ctx.lineJoin = 'round';
-        const step = hist.length > 1500 ? Math.floor(hist.length / 1500) : 1;
-        let first = true, lastX = PAD_L;
-        for (let i = 0; i < hist.length; i += step) {
-          const v = cfg.getValue(hist[i]);
-          if (v == null) continue;
-          const x = PAD_L + ((hist[i].t - tMin) / tSpan) * plotW;
-          const y = PAD_T + plotH - (Math.min(v, yMax) / yMax) * plotH;
-          if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
-          lastX = x;
+        for (const s of segments) {
+          ctx.beginPath();
+          ctx.moveTo(s[0].x, s[0].y);
+          for (let j = 1; j < s.length; j++) ctx.lineTo(s[j].x, s[j].y);
+          ctx.stroke();
+          ctx.lineTo(s[s.length - 1].x, baseY);
+          ctx.lineTo(s[0].x, baseY);
+          ctx.closePath();
+          ctx.fillStyle = cfg.color.fill;
+          ctx.fill();
         }
-        ctx.stroke();
-
-        // Fill
-        ctx.lineTo(lastX, PAD_T + plotH);
-        ctx.lineTo(PAD_L, PAD_T + plotH);
-        ctx.closePath();
-        ctx.fillStyle = cfg.color.fill;
-        ctx.fill();
 
         // Title
         ctx.fillStyle = '#333';
@@ -436,13 +482,22 @@
         chartVisible = !chartVisible;
         chartsWrap.style.display = chartVisible ? '' : 'none';
         btnClear.style.display = chartVisible ? '' : 'none';
+        rangeWrap.style.display = chartVisible ? '' : 'none';
         btnToggle.textContent = chartVisible ? 'Hide History' : 'Show History';
         section.classList.toggle('compact', chartVisible);
         if (chartVisible) {
           const h = loadHistory();
-          updateInfo(h);
-          renderAllCharts(h);
+          const fh = filterHistory(h);
+          updateInfo(fh);
+          renderAllCharts(fh);
         }
+      });
+      rangeSlider.addEventListener('input', function () {
+        if (!chartVisible) return;
+        const h = loadHistory();
+        const fh = filterHistory(h);
+        updateInfo(fh);
+        renderAllCharts(fh);
       });
       btnClear.addEventListener('click', function () {
         if (confirm('Clear all stored history?')) {
@@ -497,8 +552,9 @@
           // Store history
           const hist = pushEntry(d);
           if (chartVisible) {
-            updateInfo(hist);
-            renderAllCharts(hist);
+            const fh = filterHistory(hist);
+            updateInfo(fh);
+            renderAllCharts(fh);
           }
         } catch (e) {
           dot.className = 'dot dot-err';
@@ -508,7 +564,7 @@
       }
 
       function onResize() {
-        if (chartVisible) renderAllCharts(loadHistory());
+        if (chartVisible) renderAllCharts(filterHistory(loadHistory()));
       }
       window.addEventListener('resize', onResize);
       if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
