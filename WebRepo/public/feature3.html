@@ -117,7 +117,7 @@
         { label: 'All',    ms: Infinity },
       ];
       function filterHistory(hist) {
-        const preset = RANGE_PRESETS[parseInt(rangeSlider.value, 10)] || RANGE_PRESETS[RANGE_PRESETS.length - 1];
+        const preset = RANGE_PRESETS[parseInt(rangeSlider.value, 10)] || RANGE_PRESETS[3];
         rangeLabel.textContent = preset.label;
         if (!hist.length || preset.ms === Infinity) return hist;
         const cutoff = Date.now() - preset.ms;

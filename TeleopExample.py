@@ -6,14 +6,22 @@ import os
 import random
 import time
 import json
+import threading
+import requests
+
 import urllib.request
+import sseclient
 
 motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
 base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
-api_key = "uapi_34d18c8ae3._F1S7w6wWczztQQsLjTNCv69Jaac4HeIMc6jBUGexx4"
+api_key = "uapi_45a7a7f90d.5vcTTRVFFnCZ27ue6e6ia1B1plYDShGWl6ObNZfcUUQ"
 
 ingest_url = f"{base_url}/api/ingest"
 latest_url = f"{base_url}/api/latest"
+stream_url = f"{base_url}/api/stream"
+
+latest_command = None
+command_lock = threading.Lock()
 
 # robot_config = SO101FollowerConfig(
 #     port="/dev/tty.usbmodem58760431541",
@@ -72,6 +80,39 @@ def FollowerRecieve():
         print("ERROR", exc)
     return LeaderStatus
 
+def FollowerStream():
+    global latest_command
+    while True:
+        try:
+            response = requests.get(
+                stream_url,
+                headers={"X-API-Key": api_key},
+                stream=True,
+                timeout=30,
+            )
+
+            client = sseclient.SSEClient(response)
+
+            for event in client.events():
+                if not event.data:
+                    continue
+
+                obj = json.loads(event.data)
+                LeaderStatus = obj["payload"]
+                cmd = LeaderStatus
+                with command_lock:
+                    latest_command = cmd
+                
+        except Exception as e:
+            print("Stream disconnected, retrying...", e)
+            time.sleep(2)
+
+def FollowerAction():
+    global latest_command
+    while True:
+        time.sleep(0.1)
+        
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -83,9 +124,9 @@ def main():
     )
     args = parser.parse_args()
     if args.type == "Follower":
-        while True:
-            FollowerRecieve()
-            time.sleep(0.1)
+        recieve_thread = threading.Thread(target=FollowerStream, daemon=True)
+        recieve_thread.start()
+        FollowerAction()
 
     elif args.type == "Leader":
         teleop_config = SO101LeaderConfig(
