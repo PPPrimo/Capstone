@@ -39,20 +39,17 @@ def LeaderSend(teleop_device):
         m: {"position": positions[m], "velocity": velocity[m], "current": current[m]}
         for m in motorId
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        ingest_url,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-API-Key": api_key,
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            print(resp.status, body)
+        resp = requests.post(
+            ingest_url,
+            json=payload,
+            headers={
+                "X-API-Key": api_key,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/133.0.0.0",
+            },
+            timeout=5,
+        )
+        print(resp.status_code, resp.text)
     except Exception as exc:
         print("ERROR", exc)
 

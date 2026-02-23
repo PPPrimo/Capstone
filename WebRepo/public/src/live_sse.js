@@ -17,6 +17,14 @@ try {
   source.onmessage = (ev) => {
     try {
       const obj = JSON.parse(ev.data);
+      // Check if data is stale (received_at > 10 s ago)
+      if (obj.received_at) {
+        const ageSec = Date.now() / 1000 - obj.received_at;
+        if (ageSec > 10) {
+          setText('No live data (last update ' + Math.round(ageSec) + 's ago)');
+          return;
+        }
+      }
       setText(JSON.stringify(obj, null, 2));
     } catch {
       setText(String(ev.data));

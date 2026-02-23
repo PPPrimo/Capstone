@@ -68,13 +68,15 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
         last_keepalive = 0.0
 
         try:
-            # Send current snapshot immediately if available.
+            # Send current snapshot immediately, but only if it's fresh (≤10 s old).
             if _latest_payload is not None:
-                initial = json.dumps(
-                    {"received_at": _latest_received_at, "payload": _latest_payload},
-                    separators=(",", ":"),
-                )
-                yield f"data: {initial}\n\n"
+                age = time.time() - (_latest_received_at or 0)
+                if age <= 10:
+                    initial = json.dumps(
+                        {"received_at": _latest_received_at, "payload": _latest_payload},
+                        separators=(",",":"),
+                    )
+                    yield f"data: {initial}\n\n"
 
             # Stream updates + periodic keepalive.
             while True:
