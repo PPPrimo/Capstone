@@ -14,6 +14,11 @@ try {
   window.addEventListener('beforeunload', close);
   window.addEventListener('pagehide', close);
 
+  source.onopen = () => {
+    // Fires on initial connect AND every successful reconnect
+    setText('Connected — waiting for data...');
+  };
+
   source.onmessage = (ev) => {
     try {
       const obj = JSON.parse(ev.data);
@@ -32,7 +37,6 @@ try {
   };
 
   source.onerror = () => {
-    // EventSource will auto-reconnect; keep message minimal.
     setText('Disconnected. Retrying...');
   };
 } catch (e) {
