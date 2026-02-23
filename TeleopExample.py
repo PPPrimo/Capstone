@@ -13,8 +13,8 @@ import urllib.request
 import sseclient
 
 motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
-base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
-api_key = "uapi_45a7a7f90d.5vcTTRVFFnCZ27ue6e6ia1B1plYDShGWl6ObNZfcUUQ"
+base_url = os.getenv("PUBLISH_URL", "https://primowang.com/").rstrip("/")
+api_key = "uapi_9ef5e39e2a.2BGWx7xyUsg2oNM0lwonlIm82moxUDWH_I7llgwZgv8"
 
 ingest_url = f"{base_url}/api/ingest"
 latest_url = f"{base_url}/api/latest"
@@ -111,7 +111,7 @@ def FollowerAction():
     global latest_command
     while True:
         time.sleep(0.1)
-        
+
 
 def main():
     parser = argparse.ArgumentParser()
