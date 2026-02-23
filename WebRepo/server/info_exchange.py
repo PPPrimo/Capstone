@@ -68,6 +68,9 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
         last_keepalive = 0.0
 
         try:
+            # Send a 2KB padding comment to flush Cloudflare's response buffer.
+            yield f": {' ' * 2048}\n\n"
+
             # Send current snapshot immediately, but only if it's fresh (≤10 s old).
             if _latest_payload is not None:
                 age = time.time() - (_latest_received_at or 0)
@@ -101,7 +104,7 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
                 _subscribers.discard(queue)
 
     headers = {
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-transform",
         "Connection": "keep-alive",
         # For nginx: disable proxy buffering for SSE
         "X-Accel-Buffering": "no",

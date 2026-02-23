@@ -54,28 +54,21 @@ def LeaderSend(teleop_device):
         print("ERROR", exc)
 
 def FollowerRecieve():
-    req = urllib.request.Request(
-        latest_url,
-        method="GET",
-        headers={
-            "Accept": "application/json",
-            "X-API-Key": api_key,
-        },
-    )
+    global latest_command
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            try:
-                obj = json.loads(body)
-                LeaderStatus = obj["payload"]
-                print(LeaderStatus)
-                #print(json.dumps(obj, indent=2, sort_keys=True))
-            except json.JSONDecodeError:
-                LeaderStatus = None
-                print(body)
-    except Exception as exc:
-        print("ERROR", exc)
-    return LeaderStatus
+        resp = requests.get(
+            latest_url,
+            headers={
+                "X-API-Key": api_key,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/133.0.0.0",
+            },
+            timeout=5,
+        )
+        data = resp.json()           # decode JSON response
+        latest_command = data["payload"]  # extract payload
+    except Exception as e:
+        print("No data, retrying...", e)
+        time.sleep(2)
 
 def FollowerStream():
     global latest_command
@@ -107,6 +100,7 @@ def FollowerStream():
 def FollowerAction():
     global latest_command
     while True:
+        print(latest_command)
         time.sleep(0.1)
 
 
