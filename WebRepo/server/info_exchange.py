@@ -14,6 +14,7 @@ info_exchange_router = APIRouter()
 
 _latest_payload: dict | None = None
 _latest_received_at: float | None = None
+_latest_publisher: str | None = None
 _subscribers: set[asyncio.Queue[str]] = set()
 _subscribers_lock = asyncio.Lock()
 
@@ -22,7 +23,7 @@ _subscribers_lock = asyncio.Lock()
 async def latest(_: User = Depends(_require_active_user_or_api_key)):
     if _latest_payload is None:
         return {"received_at": None, "payload": None}
-    return {"received_at": _latest_received_at, "payload": _latest_payload}
+    return {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload}
 
 #Recieves leader action
 @info_exchange_router.post("/api/ingest")
@@ -36,9 +37,10 @@ async def ingest(payload: dict, request: Request, session=Depends(get_async_sess
     if not user:
         return PlainTextResponse("Unauthorized", status_code=401)
 
-    global _latest_payload, _latest_received_at
+    global _latest_payload, _latest_received_at, _latest_publisher
     _latest_payload = payload
     _latest_received_at = time.time()
+    _latest_publisher = user.email
 
     message = json.dumps(
         {
@@ -78,7 +80,7 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
                 age = time.time() - (_latest_received_at or 0)
                 if age <= 10:
                     initial = json.dumps(
-                        {"received_at": _latest_received_at, "payload": _latest_payload},
+                        {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
                         separators=(",",":"),
                     )
                     yield f"data: {initial}\n\n"
