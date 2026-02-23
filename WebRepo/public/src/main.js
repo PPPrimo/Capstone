@@ -21,6 +21,11 @@ tabs.forEach(t => {
   });
 });
 
+// Auto-select Feature 1 on page load so SSE starts immediately
+if (tabs.length) {
+  tabs[0].click();
+}
+
 // Hide admin-only tabs until we confirm the user is a superuser
 (async () => {
   try {

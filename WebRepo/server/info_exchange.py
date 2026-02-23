@@ -68,8 +68,10 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
         last_keepalive = 0.0
 
         try:
-            # Send a 2KB padding comment to flush Cloudflare's response buffer.
-            yield f": {' ' * 2048}\n\n"
+            # Send a 4KB padding comment to flush Cloudflare's edge buffer,
+            # then a retry hint so the browser reconnects quickly on drops.
+            yield f": {' ' * 4096}\n\n"
+            yield "retry: 1000\n\n"
 
             # Send current snapshot immediately, but only if it's fresh (≤10 s old).
             if _latest_payload is not None:
@@ -94,7 +96,7 @@ async def stream(request: Request, _: User = Depends(_require_active_user_or_api
                     if await request.is_disconnected():
                         break
                     now = time.time()
-                    if now - last_keepalive >= 15.0:
+                    if now - last_keepalive >= 5.0:
                         last_keepalive = now
                         yield ": keepalive\n\n"
                 except asyncio.CancelledError:

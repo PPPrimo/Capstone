@@ -115,7 +115,7 @@ def main():
     )
     args = parser.parse_args()
     if args.type == "Follower":
-        recieve_thread = threading.Thread(target=FollowerStream, daemon=True)
+        recieve_thread = threading.Thread(target=FollowerRecieve, daemon=True)
         recieve_thread.start()
         FollowerAction()
 
