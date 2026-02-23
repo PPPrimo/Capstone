@@ -8,11 +8,16 @@ const tabMap = {
   feature3: './feature3.html',
 };
 
+let currentTab = null;
+
 tabs.forEach(t => {
   t.addEventListener('click', () => {
+    const tab = t.dataset.tab;
+    if (tab === currentTab) return;          // already showing — skip reload
+    currentTab = tab;
     tabs.forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    frame.setAttribute('src', tabMap[t.dataset.tab]);
+    frame.setAttribute('src', tabMap[tab]);
   });
 });
 

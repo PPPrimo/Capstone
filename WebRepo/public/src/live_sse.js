@@ -1,4 +1,5 @@
 const el = document.getElementById('liveData');
+let hasReceivedData = false;
 
 function setText(text) {
   if (!el) return;
@@ -15,8 +16,10 @@ try {
   window.addEventListener('pagehide', close);
 
   source.onopen = () => {
-    // Fires on initial connect AND every successful reconnect
-    setText('Connected — waiting for data...');
+    // Only show "waiting" if we haven't received real data yet
+    if (!hasReceivedData) {
+      setText('Connected — waiting for data...');
+    }
   };
 
   source.onmessage = (ev) => {
@@ -30,6 +33,7 @@ try {
           return;
         }
       }
+      hasReceivedData = true;
       setText(JSON.stringify(obj, null, 2));
     } catch {
       setText(String(ev.data));
@@ -37,6 +41,7 @@ try {
   };
 
   source.onerror = () => {
+    hasReceivedData = false;
     setText('Disconnected. Retrying...');
   };
 } catch (e) {
