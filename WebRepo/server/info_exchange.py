@@ -4,11 +4,15 @@ import os
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, Cookie, Query
 from fastapi.responses import StreamingResponse
 
 from server.models import User
 from server.auth import _require_active_user_or_api_key, get_async_session, _authenticate_slave_api_key
+from server.auth import current_optional_user, COOKIE_NAME, JWT_SECRET, COOKIE_MAX_AGE
+
+from fastapi_users.authentication import JWTStrategy
+from sqlalchemy import select
 
 info_exchange_router = APIRouter()
 
@@ -17,6 +21,41 @@ _latest_received_at: float | None = None
 _latest_publisher: str | None = None
 _subscribers: set[asyncio.Queue[str]] = set()
 _subscribers_lock = asyncio.Lock()
+
+# ── Helper: authenticate a WebSocket connection via cookie JWT or API key ──
+async def _ws_authenticate(websocket: WebSocket) -> bool:
+    """Validate the browser cookie JWT or X-API-Key query param on a WebSocket upgrade.
+    Returns True if authenticated, False otherwise."""
+
+    # 1) Try API key from query param: /api/ws?api_key=...
+    api_key = websocket.query_params.get("api_key")
+    if api_key:
+        try:
+            from server.db import async_session_maker
+            async with async_session_maker() as session:
+                user = await _authenticate_slave_api_key(api_key, session)
+                if user is not None and getattr(user, "is_active", False):
+                    return True
+        except Exception:
+            pass
+
+    # 2) Try browser cookie JWT
+    token = websocket.cookies.get(COOKIE_NAME)
+    if not token:
+        return False
+    try:
+        strategy = JWTStrategy(secret=JWT_SECRET, lifetime_seconds=COOKIE_MAX_AGE)
+        from server.db import async_session_maker
+        async with async_session_maker() as session:
+            from server.models import User as UserModel
+            from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
+            user_db = SQLAlchemyUserDatabase(session, UserModel)
+            from server.auth import UserManager
+            user_manager = UserManager(user_db)
+            user = await strategy.read_token(token, user_manager)
+            return user is not None and getattr(user, "is_active", False)
+    except Exception:
+        return False
 
 #Responds to follower request (*Outdated)
 @info_exchange_router.get("/api/latest")
@@ -60,57 +99,44 @@ async def ingest(payload: dict, request: Request, session=Depends(get_async_sess
 
     return {"ok": True}
 
-@info_exchange_router.get("/api/stream")
-async def stream(request: Request, _: User = Depends(_require_active_user_or_api_key)):
-    async def event_generator():
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
+@info_exchange_router.websocket("/api/ws")
+async def ws_stream(websocket: WebSocket):
+    """WebSocket endpoint for real-time telemetry push to the browser."""
+
+    # Authenticate via cookie before accepting
+    if not await _ws_authenticate(websocket):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
+    await websocket.accept()
+
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
+    async with _subscribers_lock:
+        _subscribers.add(queue)
+
+    try:
+        # Send current snapshot immediately if it's fresh (≤10 s old).
+        if _latest_payload is not None:
+            age = time.time() - (_latest_received_at or 0)
+            if age <= 10:
+                initial = json.dumps(
+                    {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
+                    separators=(",", ":"),
+                )
+                await websocket.send_text(initial)
+
+        # Push updates as they arrive; send ping every 10s to keep the connection alive.
+        while True:
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=10.0)
+                await websocket.send_text(msg)
+            except asyncio.TimeoutError:
+                # Send a WebSocket ping to keep the connection alive through Cloudflare
+                await websocket.send_text('{"ping":true}')
+            except WebSocketDisconnect:
+                break
+            except asyncio.CancelledError:
+                break
+    finally:
         async with _subscribers_lock:
-            _subscribers.add(queue)
-
-        last_keepalive = 0.0
-
-        try:
-            # Send a 4KB padding comment to flush Cloudflare's edge buffer,
-            # then a retry hint so the browser reconnects quickly on drops.
-            yield f": {' ' * 4096}\n\n"
-            yield "retry: 1000\n\n"
-
-            # Send current snapshot immediately, but only if it's fresh (≤10 s old).
-            if _latest_payload is not None:
-                age = time.time() - (_latest_received_at or 0)
-                if age <= 10:
-                    initial = json.dumps(
-                        {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
-                        separators=(",",":"),
-                    )
-                    yield f"data: {initial}\n\n"
-
-            # Stream updates + periodic keepalive.
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    # Small timeout so we notice disconnects quickly.
-                    msg = await asyncio.wait_for(queue.get(), timeout=2.0)
-                    yield f"data: {msg}\n\n"
-                except asyncio.TimeoutError:
-                    # Check disconnect again, then emit keepalive at most every 15s.
-                    if await request.is_disconnected():
-                        break
-                    now = time.time()
-                    if now - last_keepalive >= 5.0:
-                        last_keepalive = now
-                        yield ": keepalive\n\n"
-                except asyncio.CancelledError:
-                    break
-        finally:
-            async with _subscribers_lock:
-                _subscribers.discard(queue)
-
-    headers = {
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        # For nginx: disable proxy buffering for SSE
-        "X-Accel-Buffering": "no",
-    }
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+            _subscribers.discard(queue)

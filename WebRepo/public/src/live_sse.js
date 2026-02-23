@@ -1,44 +1,41 @@
 const el = document.getElementById('liveData');
-let lastReceivedAt = 0;
 
 function setText(text) {
   if (!el) return;
   el.textContent = text;
 }
 
-function display(obj) {
-  // Deduplicate: skip if we already showed this exact timestamp
-  if (obj.received_at && obj.received_at <= lastReceivedAt) return;
-  lastReceivedAt = obj.received_at || 0;
-  setText(JSON.stringify(obj, null, 2));
-}
+// ── WebSocket connection with auto-reconnect ──
+const WS_RECONNECT_MS = 1000;
+let ws = null;
 
-// ── Primary: poll /api/latest every 500ms (works through Cloudflare reliably) ──
-async function poll() {
-  try {
-    const res = await fetch('/api/latest', { credentials: 'same-origin' });
-    if (!res.ok) return;
-    const obj = await res.json();
-    if (obj.payload) display(obj);
-  } catch { /* ignore, will retry next tick */ }
-}
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/api/ws`);
 
-let pollTimer = setInterval(poll, 500);
+  ws.onopen = () => {
+    setText('Connected — waiting for data...');
+  };
 
-// ── Bonus: SSE for lower-latency updates when Cloudflare cooperates ──
-try {
-  const source = new EventSource('/api/stream');
-
-  window.addEventListener('beforeunload', () => { try { source.close(); } catch {} });
-  window.addEventListener('pagehide',     () => { try { source.close(); } catch {} });
-
-  source.onmessage = (ev) => {
+  ws.onmessage = (ev) => {
     try {
       const obj = JSON.parse(ev.data);
-      if (obj.payload) display(obj);
+      if (obj.ping) return;            // keepalive, ignore
+      if (obj.payload) {
+        setText(JSON.stringify(obj, null, 2));
+      }
     } catch { /* ignore malformed */ }
   };
-} catch { /* SSE not supported — polling alone is fine */ }
 
-// Initial fetch
-poll();
+  ws.onclose = () => {
+    setText('Disconnected. Reconnecting...');
+    setTimeout(connect, WS_RECONNECT_MS);
+  };
+
+  ws.onerror = () => {
+    // onclose will fire after this, which triggers reconnect
+    ws.close();
+  };
+}
+
+connect();

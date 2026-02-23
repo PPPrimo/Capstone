@@ -9,16 +9,19 @@ import json
 import threading
 import requests
 
-import urllib.request
-import sseclient
+import websockets
+import asyncio
 
 motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
 base_url = os.getenv("PUBLISH_URL", "https://primowang.com/").rstrip("/")
+base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
+
 api_key = "uapi_9ef5e39e2a.2BGWx7xyUsg2oNM0lwonlIm82moxUDWH_I7llgwZgv8"
+api_key = "uapi_8139a97701.5VLxX7OxnZ2thJNQM26tnNQJahKWsGane9WMQW_OIhQ"
 
 ingest_url = f"{base_url}/api/ingest"
 latest_url = f"{base_url}/api/latest"
-stream_url = f"{base_url}/api/stream"
+ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + f"/api/ws?api_key={api_key}"
 
 latest_command = None
 command_lock = threading.Lock()
@@ -55,47 +58,50 @@ def LeaderSend(teleop_device):
 
 def FollowerRecieve():
     global latest_command
-    try:
-        resp = requests.get(
-            latest_url,
-            headers={
-                "X-API-Key": api_key,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/133.0.0.0",
-            },
-            timeout=5,
-        )
-        data = resp.json()           # decode JSON response
-        latest_command = data["payload"]  # extract payload
-    except Exception as e:
-        print("No data, retrying...", e)
-        time.sleep(2)
-
-def FollowerStream():
-    global latest_command
     while True:
         try:
-            response = requests.get(
-                stream_url,
-                headers={"X-API-Key": api_key},
-                stream=True,
-                timeout=30,
+            resp = requests.get(
+                latest_url,
+                headers={
+                    "X-API-Key": api_key,
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/133.0.0.0",
+                },
+                timeout=5,
             )
-
-            client = sseclient.SSEClient(response)
-
-            for event in client.events():
-                if not event.data:
-                    continue
-
-                obj = json.loads(event.data)
-                LeaderStatus = obj["payload"]
-                cmd = LeaderStatus
-                with command_lock:
-                    latest_command = cmd
-                
+            data = resp.json()
+            with command_lock:
+                latest_command = data["payload"]
         except Exception as e:
-            print("Stream disconnected, retrying...", e)
-            time.sleep(2)
+            print("No data, retrying...", e)
+        time.sleep(0.1)
+
+def FollowerStream():
+    """Connect to the server via WebSocket and receive push updates."""
+    global latest_command
+
+    async def FollowerLoop():
+        
+        global latest_command
+        while True:
+            try:
+                async with websockets.connect(ws_url) as ws:
+                    print("WebSocket connected")
+                    async for raw in ws:
+                        try:
+                            rsp = json.loads(raw)
+                            if rsp.get("ping"):
+                                continue
+                            payload = rsp.get("payload")
+                            if payload:
+                                with command_lock:
+                                    latest_command = payload
+                        except json.JSONDecodeError:
+                            pass
+            except Exception as e:
+                print("WebSocket disconnected, retrying...", e)
+                await asyncio.sleep(1)
+
+    asyncio.run(FollowerLoop())
 
 def FollowerAction():
     global latest_command
@@ -115,7 +121,7 @@ def main():
     )
     args = parser.parse_args()
     if args.type == "Follower":
-        recieve_thread = threading.Thread(target=FollowerRecieve, daemon=True)
+        recieve_thread = threading.Thread(target=FollowerStream, daemon=True)
         recieve_thread.start()
         FollowerAction()
 
