@@ -519,6 +519,12 @@
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const d = await res.json();
 
+          // Always store history, even when tab is hidden
+          const hist = pushEntry(d);
+
+          // Skip UI updates when the tab is not visible
+          if (document.hidden) return;
+
           errBox.style.display = 'none';
           dot.className = 'dot dot-ok';
 
@@ -549,19 +555,25 @@
           // Dynamic disk cards
           updateDiskCards(d.disks);
 
-          // Store history
-          const hist = pushEntry(d);
+          // Update charts if visible
           if (chartVisible) {
             const fh = filterHistory(hist);
             updateInfo(fh);
             renderAllCharts(fh);
           }
         } catch (e) {
-          dot.className = 'dot dot-err';
-          errBox.textContent = 'Failed to fetch stats: ' + e.message;
-          errBox.style.display = '';
+          if (!document.hidden) {
+            dot.className = 'dot dot-err';
+            errBox.textContent = 'Failed to fetch stats: ' + e.message;
+            errBox.style.display = '';
+          }
         }
       }
+
+      // Refresh UI immediately when tab becomes visible again
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) poll();
+      });
 
       function onResize() {
         if (chartVisible) renderAllCharts(filterHistory(loadHistory()));
