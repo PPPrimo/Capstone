@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, Cookie, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from server.models import User
 from server.auth import _require_active_user_or_api_key, get_async_session, _authenticate_slave_api_key
@@ -64,7 +64,7 @@ async def latest(_: User = Depends(_require_active_user_or_api_key)):
         return {"received_at": None, "payload": None}
     return {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload}
 
-#Recieves leader action
+#Recieves leader action *needs to modify into dual direction
 @info_exchange_router.post("/api/ingest")
 async def ingest(payload: dict, request: Request, session=Depends(get_async_session)):
     """API for the slave node to publish the latest telemetry snapshot.
@@ -115,15 +115,13 @@ async def ws_stream(websocket: WebSocket):
         _subscribers.add(queue)
 
     try:
-        # Send current snapshot immediately if it's fresh (≤10 s old).
+        # Always send the latest snapshot so new clients have data immediately.
         if _latest_payload is not None:
-            age = time.time() - (_latest_received_at or 0)
-            if age <= 10:
-                initial = json.dumps(
-                    {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
-                    separators=(",", ":"),
-                )
-                await websocket.send_text(initial)
+            initial = json.dumps(
+                {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
+                separators=(",", ":"),
+            )
+            await websocket.send_text(initial)
 
         # Push updates as they arrive; send ping every 10s to keep the connection alive.
         while True:

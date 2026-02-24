@@ -8,8 +8,11 @@ function setText(text) {
 // ── WebSocket connection with auto-reconnect ──
 const WS_RECONNECT_MS = 1000;
 let ws = null;
+let alive = true;  // false when page is being unloaded / hidden
 
 function connect() {
+  if (!alive) return;
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/api/ws`);
 
@@ -28,14 +31,26 @@ function connect() {
   };
 
   ws.onclose = () => {
+    if (!alive) return;                // don't reconnect if page is going away
     setText('Disconnected. Reconnecting...');
     setTimeout(connect, WS_RECONNECT_MS);
   };
 
   ws.onerror = () => {
-    // onclose will fire after this, which triggers reconnect
     ws.close();
   };
 }
+
+// Clean up when the iframe is unloaded (tab switch) to prevent zombie connections
+function cleanup() {
+  alive = false;
+  if (ws) {
+    ws.onclose = null;  // prevent reconnect
+    ws.close();
+    ws = null;
+  }
+}
+window.addEventListener('beforeunload', cleanup);
+window.addEventListener('pagehide', cleanup);
 
 connect();

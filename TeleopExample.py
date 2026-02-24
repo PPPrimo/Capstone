@@ -14,10 +14,10 @@ import asyncio
 
 motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
 base_url = os.getenv("PUBLISH_URL", "https://primowang.com/").rstrip("/")
-base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
+#base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
 
-api_key = "uapi_9ef5e39e2a.2BGWx7xyUsg2oNM0lwonlIm82moxUDWH_I7llgwZgv8"
-api_key = "uapi_8139a97701.5VLxX7OxnZ2thJNQM26tnNQJahKWsGane9WMQW_OIhQ"
+api_key = "uapi_dc1ab5d444.bxAGSutbbRAuAM8gPw4Hj5AiCPBEdfKbxoczrki0ak4"
+#api_key = "uapi_8139a97701.5VLxX7OxnZ2thJNQM26tnNQJahKWsGane9WMQW_OIhQ"
 
 ingest_url = f"{base_url}/api/ingest"
 latest_url = f"{base_url}/api/latest"
