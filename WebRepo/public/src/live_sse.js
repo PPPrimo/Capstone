@@ -11,7 +11,7 @@ function setText(text) {
 // - treat the connection as stale quickly if pings/data stop
 const WS_RECONNECT_BASE_MS = 250;
 const WS_RECONNECT_MAX_MS = 1000;
-const WS_STALE_MS = 2000; // no ping/data for this long => reconnect
+const WS_STALE_MS = 5000; // no ping/data for this long => reconnect
 let ws = null;
 let shouldReconnect = true; // false when page is being unloaded; true on normal display
 let lastMessageAt = Date.now();
@@ -27,7 +27,7 @@ function startStaleWatchdog() {
     if (Date.now() - lastMessageAt > WS_STALE_MS) {
       try { ws.close(); } catch { /* ignore */ }
     }
-  }, 250);
+  }, 500);
 }
 
 function stopStaleWatchdog() {

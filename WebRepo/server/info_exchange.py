@@ -20,16 +20,10 @@ _latest_payload: dict | None = None
 _latest_received_at: float | None = None
 _latest_publisher: str | None = None
 
-
-class _Subscriber:
-    __slots__ = ("event", "latest")
-
-    def __init__(self):
-        self.event = asyncio.Event()
-        self.latest: str | None = None
-
-
-_subscribers: set[_Subscriber] = set()
+# WebSocket subscribers receive *latest-only* updates.
+# Each client has its own queue (maxsize=1) so slow clients never build backlog
+# and cannot introduce lag/jitter for others.
+_subscribers: set[asyncio.Queue[str]] = set()
 _subscribers_lock = asyncio.Lock()
 
 # ── Helper: authenticate a WebSocket connection via cookie JWT or API key ──
@@ -101,10 +95,17 @@ async def ingest(payload: dict, request: Request, session=Depends(get_async_sess
     )
 
     async with _subscribers_lock:
-        # Latest-only fanout: never build a backlog (avoids lag/jitter).
-        for sub in list(_subscribers):
-            sub.latest = message
-            sub.event.set()
+        for q in list(_subscribers):
+            # Latest-only: if the client is slow, drop the older pending item.
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
 
     return {"ok": True}
 
@@ -119,12 +120,19 @@ async def ws_stream(websocket: WebSocket):
 
     await websocket.accept()
 
-    sub = _Subscriber()
-    async with _subscribers_lock:
-        _subscribers.add(sub)
+    # Heuristic:
+    # - API-key clients are teleop (need full-rate, minimal jitter)
+    # - Cookie-auth clients are browser UI (throttle to reduce impact on teleop)
+    is_ui_client = websocket.query_params.get("api_key") is None
 
-    PING_INTERVAL_S = 0.5
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+    async with _subscribers_lock:
+        _subscribers.add(queue)
+
+    PING_INTERVAL_S = 1.0
     SEND_TIMEOUT_S = 1.0
+    UI_MIN_INTERVAL_S = 0.2  # 5Hz; UI doesn't need 100ms updates
+    last_ui_send_at = 0.0
 
     try:
         # Always send the latest snapshot so new clients have data immediately.
@@ -134,24 +142,21 @@ async def ws_stream(websocket: WebSocket):
                 separators=(",", ":"),
             )
             await asyncio.wait_for(websocket.send_text(initial), timeout=SEND_TIMEOUT_S)
-            next_ping_at = time.monotonic() + PING_INTERVAL_S
-
-        if _latest_payload is None:
-            next_ping_at = time.monotonic() + PING_INTERVAL_S
 
         while True:
-            # Wait either for new telemetry or for the next scheduled ping.
-            timeout_s = max(0.0, next_ping_at - time.monotonic())
             try:
-                await asyncio.wait_for(sub.event.wait(), timeout=timeout_s)
-                sub.event.clear()
-                if sub.latest is not None:
-                    await asyncio.wait_for(websocket.send_text(sub.latest), timeout=SEND_TIMEOUT_S)
-                    next_ping_at = time.monotonic() + PING_INTERVAL_S
+                msg = await asyncio.wait_for(queue.get(), timeout=PING_INTERVAL_S)
+
+                if is_ui_client:
+                    now = time.monotonic()
+                    if now - last_ui_send_at < UI_MIN_INTERVAL_S:
+                        continue  # drop intermediate UI updates; keep newest-only behavior
+                    last_ui_send_at = now
+
+                await asyncio.wait_for(websocket.send_text(msg), timeout=SEND_TIMEOUT_S)
             except asyncio.TimeoutError:
                 # Keepalive ping (helps traverse Cloudflare and detects half-open sockets quickly).
                 await asyncio.wait_for(websocket.send_text('{"ping":true}'), timeout=SEND_TIMEOUT_S)
-                next_ping_at = time.monotonic() + PING_INTERVAL_S
             except WebSocketDisconnect:
                 break
             except asyncio.CancelledError:
@@ -160,4 +165,4 @@ async def ws_stream(websocket: WebSocket):
                 break
     finally:
         async with _subscribers_lock:
-            _subscribers.discard(sub)
+            _subscribers.discard(queue)
