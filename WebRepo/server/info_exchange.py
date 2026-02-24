@@ -19,7 +19,17 @@ info_exchange_router = APIRouter()
 _latest_payload: dict | None = None
 _latest_received_at: float | None = None
 _latest_publisher: str | None = None
-_subscribers: set[asyncio.Queue[str]] = set()
+
+
+class _Subscriber:
+    __slots__ = ("event", "latest")
+
+    def __init__(self):
+        self.event = asyncio.Event()
+        self.latest: str | None = None
+
+
+_subscribers: set[_Subscriber] = set()
 _subscribers_lock = asyncio.Lock()
 
 # ── Helper: authenticate a WebSocket connection via cookie JWT or API key ──
@@ -91,11 +101,10 @@ async def ingest(payload: dict, request: Request, session=Depends(get_async_sess
     )
 
     async with _subscribers_lock:
-        for q in list(_subscribers):
-            #drop if client is slow
-            if q.full():
-                continue
-            q.put_nowait(message)
+        # Latest-only fanout: never build a backlog (avoids lag/jitter).
+        for sub in list(_subscribers):
+            sub.latest = message
+            sub.event.set()
 
     return {"ok": True}
 
@@ -110,9 +119,12 @@ async def ws_stream(websocket: WebSocket):
 
     await websocket.accept()
 
-    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
+    sub = _Subscriber()
     async with _subscribers_lock:
-        _subscribers.add(queue)
+        _subscribers.add(sub)
+
+    PING_INTERVAL_S = 0.5
+    SEND_TIMEOUT_S = 1.0
 
     try:
         # Always send the latest snapshot so new clients have data immediately.
@@ -121,20 +133,31 @@ async def ws_stream(websocket: WebSocket):
                 {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
                 separators=(",", ":"),
             )
-            await websocket.send_text(initial)
+            await asyncio.wait_for(websocket.send_text(initial), timeout=SEND_TIMEOUT_S)
+            next_ping_at = time.monotonic() + PING_INTERVAL_S
 
-        # Push updates as they arrive; send ping every 10s to keep the connection alive.
+        if _latest_payload is None:
+            next_ping_at = time.monotonic() + PING_INTERVAL_S
+
         while True:
+            # Wait either for new telemetry or for the next scheduled ping.
+            timeout_s = max(0.0, next_ping_at - time.monotonic())
             try:
-                msg = await asyncio.wait_for(queue.get(), timeout=10.0)
-                await websocket.send_text(msg)
+                await asyncio.wait_for(sub.event.wait(), timeout=timeout_s)
+                sub.event.clear()
+                if sub.latest is not None:
+                    await asyncio.wait_for(websocket.send_text(sub.latest), timeout=SEND_TIMEOUT_S)
+                    next_ping_at = time.monotonic() + PING_INTERVAL_S
             except asyncio.TimeoutError:
-                # Send a WebSocket ping to keep the connection alive through Cloudflare
-                await websocket.send_text('{"ping":true}')
+                # Keepalive ping (helps traverse Cloudflare and detects half-open sockets quickly).
+                await asyncio.wait_for(websocket.send_text('{"ping":true}'), timeout=SEND_TIMEOUT_S)
+                next_ping_at = time.monotonic() + PING_INTERVAL_S
             except WebSocketDisconnect:
                 break
             except asyncio.CancelledError:
                 break
+            except Exception:
+                break
     finally:
         async with _subscribers_lock:
-            _subscribers.discard(queue)
+            _subscribers.discard(sub)

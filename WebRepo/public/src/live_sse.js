@@ -6,12 +6,18 @@ function setText(text) {
 }
 
 // ── WebSocket connection with auto-reconnect ──
-const WS_RECONNECT_MS = 1000;
-const WS_STALE_MS = 3000; // if no ping/data for this long, force reconnect
+// Teleop constraints:
+// - reconnect within 1s
+// - treat the connection as stale quickly if pings/data stop
+const WS_RECONNECT_BASE_MS = 250;
+const WS_RECONNECT_MAX_MS = 1000;
+const WS_STALE_MS = 2000; // no ping/data for this long => reconnect
 let ws = null;
 let shouldReconnect = true; // false when page is being unloaded; true on normal display
 let lastMessageAt = Date.now();
 let staleTimer = null;
+let reconnectDelayMs = WS_RECONNECT_BASE_MS;
+let reconnectTimer = null;
 
 function startStaleWatchdog() {
   if (staleTimer) return;
@@ -21,13 +27,24 @@ function startStaleWatchdog() {
     if (Date.now() - lastMessageAt > WS_STALE_MS) {
       try { ws.close(); } catch { /* ignore */ }
     }
-  }, 1000);
+  }, 250);
 }
 
 function stopStaleWatchdog() {
   if (!staleTimer) return;
   clearInterval(staleTimer);
   staleTimer = null;
+}
+
+function scheduleReconnect() {
+  if (!shouldReconnect) return;
+  if (reconnectTimer) return;
+  const delay = Math.min(reconnectDelayMs, WS_RECONNECT_MAX_MS);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, WS_RECONNECT_MAX_MS);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
 }
 
 function connect() {
@@ -40,6 +57,7 @@ function connect() {
   ws.onopen = () => {
     setText('Connected — waiting for data...');
     lastMessageAt = Date.now();
+    reconnectDelayMs = WS_RECONNECT_BASE_MS;
     startStaleWatchdog();
   };
 
@@ -54,11 +72,19 @@ function connect() {
     } catch { /* ignore malformed */ }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     stopStaleWatchdog();
     if (!shouldReconnect) return;      // don't reconnect if page is going away
+
+    // Auth failed/expired: server uses 4401/4403. Retrying won't help.
+    if (ev && (ev.code === 4401 || ev.code === 4403)) {
+      shouldReconnect = false;
+      setText('Disconnected: Unauthorized. Please refresh and log in again.');
+      return;
+    }
+
     setText('Disconnected. Reconnecting...');
-    setTimeout(connect, WS_RECONNECT_MS);
+    scheduleReconnect();
   };
 
   ws.onerror = () => {
@@ -69,6 +95,10 @@ function connect() {
 // Clean up when the iframe is unloaded (tab switch) to prevent zombie connections
 function cleanup() {
   shouldReconnect = false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (ws) {
     ws.onclose = null;  // prevent reconnect
     ws.close();
