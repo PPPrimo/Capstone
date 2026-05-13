@@ -581,6 +581,31 @@
       window.addEventListener('resize', onResize);
       if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
 
+      // On load, pull the server-side history (collected even when this page was closed)
+      // and merge it into localStorage so the chart reflects the full uptime span.
+      async function loadServerHistory() {
+        try {
+          const res = await fetch('/api/system-history', { credentials: 'same-origin' });
+          if (!res.ok) return;
+          const serverEntries = await res.json();
+          if (!Array.isArray(serverEntries) || !serverEntries.length) return;
+          const local = loadHistory();
+          const localTimes = new Set(local.map(e => e.t));
+          const merged = [...local];
+          for (const e of serverEntries) {
+            if (!localTimes.has(e.t)) merged.push(e);
+          }
+          merged.sort((a, b) => a.t - b.t);
+          saveHistory(merged);
+          if (chartVisible) {
+            const fh = filterHistory(loadHistory());
+            updateInfo(fh);
+            renderAllCharts(fh);
+          }
+        } catch (_) { /* non-fatal — local history still works */ }
+      }
+      loadServerHistory();
+
       poll();
       setInterval(poll, POLL_MS);
     })();

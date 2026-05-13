@@ -1,6 +1,9 @@
 import asyncio
+import collections
+import json
 import shutil
 import subprocess
+import time as _time
 import psutil
 
 from pathlib import Path
@@ -10,6 +13,16 @@ from server.auth import current_superuser
 from server.models import User
 
 server_status_router = APIRouter()
+
+# ── Background stats collection ──
+_SENSITIVE_DIR = Path(__file__).resolve().parent / "sensitive"
+_HISTORY_FILE = _SENSITIVE_DIR / "stats_history.json"
+_MAX_ENTRIES = 80_000
+_COLLECT_INTERVAL_S = 2.0
+_PERSIST_INTERVAL_S = 60.0
+
+_stats_history: collections.deque = collections.deque(maxlen=_MAX_ENTRIES)
+_history_lock = asyncio.Lock()
 
 # ── /api/system-stats  ──  admin-only live machine metrics ──
 def _read_cpu_temp() -> float | None:
@@ -105,3 +118,119 @@ async def system_stats(_: User = Depends(current_superuser)):
         "vram_percent": gpu["vram_percent"],
         "disks": disks,
     }
+
+
+def _collect_stats_sync() -> dict:
+    """Collect system stats synchronously — intended to run in a thread executor."""
+    gpu = _read_gpu_nvidia()
+    cpu_temp = _read_cpu_temp()
+    mem = psutil.virtual_memory()
+    disks = []
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            disks.append({
+                "device": part.device,
+                "mountpoint": part.mountpoint,
+                "fstype": part.fstype,
+                "total_gb": round(usage.total / (1024 ** 3), 2),
+                "used_gb": round(usage.used / (1024 ** 3), 2),
+                "free_gb": round(usage.free / (1024 ** 3), 2),
+                "percent": usage.percent,
+            })
+        except (PermissionError, OSError):
+            continue
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=0.3),
+        "cpu_temp_c": cpu_temp,
+        "ram_total_gb": round(mem.total / (1024 ** 3), 2),
+        "ram_used_gb": round(mem.used / (1024 ** 3), 2),
+        "ram_percent": mem.percent,
+        "gpu_percent": gpu["gpu_percent"],
+        "gpu_temp_c": gpu["gpu_temp_c"],
+        "gpu_name": gpu["gpu_name"],
+        "vram_used_mb": gpu["vram_used_mb"],
+        "vram_total_mb": gpu["vram_total_mb"],
+        "vram_percent": gpu["vram_percent"],
+        "disks": disks,
+    }
+
+
+def _raw_to_entry(raw: dict, t_ms: float) -> dict:
+    """Convert a raw stats dict to the compact entry format used by the browser's localStorage."""
+    entry: dict = {
+        "t": t_ms,
+        "cpu": raw.get("cpu_percent"),
+        "ram": raw.get("ram_percent"),
+        "ramU": raw.get("ram_used_gb"),
+        "ramT": raw.get("ram_total_gb"),
+        "gpu": raw.get("gpu_percent"),
+        "vram": raw.get("vram_percent"),
+        "cpuT": raw.get("cpu_temp_c"),
+        "gpuT": raw.get("gpu_temp_c"),
+    }
+    for dk in (raw.get("disks") or []):
+        entry["d_" + dk["mountpoint"]] = dk["percent"]
+    return entry
+
+
+async def _load_persisted_history() -> None:
+    """Load previously persisted history from disk into the in-memory deque on startup."""
+    if not _HISTORY_FILE.exists():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, lambda: json.loads(_HISTORY_FILE.read_text("utf-8"))
+        )
+        if isinstance(data, list):
+            async with _history_lock:
+                for entry in data[-_MAX_ENTRIES:]:
+                    _stats_history.append(entry)
+    except Exception:
+        pass  # Corrupt or missing file — start fresh
+
+
+async def persist_stats_history() -> None:
+    """Flush the in-memory history deque to disk."""
+    async with _history_lock:
+        snapshot = list(_stats_history)
+    if not snapshot:
+        return
+    try:
+        payload = json.dumps(snapshot, separators=(",", ":"))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: _HISTORY_FILE.write_text(payload, "utf-8")
+        )
+    except Exception:
+        pass
+
+
+async def stats_collector_task() -> None:
+    """Background task: sample system stats every 2 s and persist to disk every 60 s.
+    Runs for as long as the server is up — independent of any browser connection.
+    """
+    await _load_persisted_history()
+    loop = asyncio.get_running_loop()
+    last_persist = _time.monotonic()
+    while True:
+        try:
+            raw = await loop.run_in_executor(None, _collect_stats_sync)
+            entry = _raw_to_entry(raw, _time.time() * 1000)
+            async with _history_lock:
+                _stats_history.append(entry)
+        except Exception:
+            pass
+        now = _time.monotonic()
+        if now - last_persist >= _PERSIST_INTERVAL_S:
+            await persist_stats_history()
+            last_persist = now
+        await asyncio.sleep(_COLLECT_INTERVAL_S)
+
+
+@server_status_router.get("/api/system-history")
+async def system_history(_: User = Depends(current_superuser)):
+    """Return the full server-side stats history (admin only)."""
+    async with _history_lock:
+        return list(_stats_history)

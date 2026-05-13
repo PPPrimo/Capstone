@@ -17,8 +17,8 @@ from sqlalchemy import select
 from server.auth import auth_backend, cookie_transport, current_active_user, current_optional_user, current_superuser, fastapi_users
 from server.db import create_db_and_tables, get_async_session
 from server.models import User
-from server.server_status import server_status_router
-from server.info_exchange import info_exchange_router
+from server.server_status import server_status_router, stats_collector_task, persist_stats_history
+from server.info_exchange import info_exchange_router, info_exchange_startup, info_exchange_shutdown
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 PUBLIC_DIR = WORKSPACE_DIR / "public"
@@ -27,17 +27,30 @@ app = FastAPI()
 app.include_router(server_status_router)
 app.include_router(info_exchange_router)
 
+_collector_task: asyncio.Task | None = None
+
 # --- Telemetry: slave -> server -> browser (SSE) ---
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 
 
 @app.on_event("startup")
 async def on_startup():
+    global _collector_task
     await create_db_and_tables()
+    await info_exchange_startup()
+    _collector_task = asyncio.create_task(stats_collector_task())
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    pass
+    global _collector_task
+    await info_exchange_shutdown()
+    if _collector_task:
+        _collector_task.cancel()
+        try:
+            await _collector_task
+        except asyncio.CancelledError:
+            pass
+    await persist_stats_history()
 
 # Framework-managed auth routes:
 # - POST /auth/jwt/login

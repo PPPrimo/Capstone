@@ -6,25 +6,48 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, Cookie, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi_users.authentication import JWTStrategy
+from sqlalchemy import select
+import redis.asyncio as redis
 
 from server.models import User
 from server.auth import _require_active_user_or_api_key, get_async_session, _authenticate_slave_api_key
 from server.auth import current_optional_user, COOKIE_NAME, JWT_SECRET, COOKIE_MAX_AGE
 
-from fastapi_users.authentication import JWTStrategy
-from sqlalchemy import select
-
 info_exchange_router = APIRouter()
 
-_latest_payload: dict | None = None
-_latest_received_at: float | None = None
-_latest_publisher: str | None = None
+REDIS_URL        = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+REDIS_LATEST_KEY = "info_exchange:latest"
+REDIS_CHANNEL    = "info_exchange:update"
 
-# WebSocket subscribers receive *latest-only* updates.
-# Each client has its own queue (maxsize=1) so slow clients never build backlog
-# and cannot introduce lag/jitter for others.
+# Per-worker local cache — updated by the Redis subscriber task so the WS
+# initial-snapshot requires no extra Redis GET.  Also used as fallback when
+# Redis is unavailable (single-worker dev mode).
+_local_cache: str | None = None
+
+_redis_client: redis.Redis | None = None
+_redis_sub_task: asyncio.Task | None = None
+
+# Per-worker WebSocket subscribers — asyncio queues for intra-process fan-out.
+# Each client has its own queue (maxsize=1) so slow clients never build backlog.
 _subscribers: set[asyncio.Queue[str]] = set()
 _subscribers_lock = asyncio.Lock()
+
+
+async def _fan_out_local(message: str) -> None:
+    """Push a message to all local (intra-worker) WebSocket subscriber queues."""
+    async with _subscribers_lock:
+        for q in list(_subscribers):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                pass
+
 
 # ── Helper: authenticate a WebSocket connection via cookie JWT or API key ──
 async def _ws_authenticate(websocket: WebSocket) -> bool:
@@ -64,9 +87,19 @@ async def _ws_authenticate(websocket: WebSocket) -> bool:
 #Responds to follower request (*Outdated)
 @info_exchange_router.get("/api/latest")
 async def latest(_: User = Depends(_require_active_user_or_api_key)):
-    if _latest_payload is None:
+    raw: str | None = None
+    if _redis_client is not None:
+        try:
+            raw = await _redis_client.get(REDIS_LATEST_KEY)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+        except Exception:
+            pass
+    if raw is None:
+        raw = _local_cache
+    if raw is None:
         return {"received_at": None, "payload": None}
-    return {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload}
+    return json.loads(raw)
 
 #Recieves leader action *needs to modify into dual direction
 @info_exchange_router.post("/api/ingest")
@@ -80,32 +113,32 @@ async def ingest(payload: dict, request: Request, session=Depends(get_async_sess
     if not user:
         return PlainTextResponse("Unauthorized", status_code=401)
 
-    global _latest_payload, _latest_received_at, _latest_publisher
-    _latest_payload = payload
-    _latest_received_at = time.time()
-    _latest_publisher = user.email
-
+    global _local_cache
+    received_at = time.time()
     message = json.dumps(
         {
-            "received_at": _latest_received_at,
+            "received_at": received_at,
             "publisher": user.email,
-            "payload": _latest_payload,
+            "payload": payload,
         },
         separators=(",", ":"),
     )
 
-    async with _subscribers_lock:
-        for q in list(_subscribers):
-            # Latest-only: if the client is slow, drop the older pending item.
-            if q.full():
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                q.put_nowait(message)
-            except asyncio.QueueFull:
-                pass
+    if _redis_client is not None:
+        try:
+            await _redis_client.set(REDIS_LATEST_KEY, message)
+            await _redis_client.publish(REDIS_CHANNEL, message)
+            # Fan-out to local WS queues is handled by _redis_fan_out_task
+            # running in every worker — do NOT also call _fan_out_local here
+            # or subscribers in this worker would receive the message twice.
+        except Exception:
+            # Redis unavailable mid-operation — fall back to local delivery.
+            _local_cache = message
+            await _fan_out_local(message)
+    else:
+        # No Redis: single-worker in-process fallback.
+        _local_cache = message
+        await _fan_out_local(message)
 
     return {"ok": True}
 
@@ -136,11 +169,17 @@ async def ws_stream(websocket: WebSocket):
 
     try:
         # Always send the latest snapshot so new clients have data immediately.
-        if _latest_payload is not None:
-            initial = json.dumps(
-                {"received_at": _latest_received_at, "publisher": _latest_publisher, "payload": _latest_payload},
-                separators=(",", ":"),
-            )
+        initial: str | None = None
+        if _redis_client is not None:
+            try:
+                raw = await _redis_client.get(REDIS_LATEST_KEY)
+                if raw is not None:
+                    initial = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            except Exception:
+                pass
+        if initial is None:
+            initial = _local_cache
+        if initial is not None:
             await asyncio.wait_for(websocket.send_text(initial), timeout=SEND_TIMEOUT_S)
 
         while True:
@@ -166,3 +205,59 @@ async def ws_stream(websocket: WebSocket):
     finally:
         async with _subscribers_lock:
             _subscribers.discard(queue)
+
+
+# ── Redis pub/sub subscriber: one task per worker process ──
+
+async def _redis_fan_out_task() -> None:
+    """Subscribe to the Redis telemetry channel and fan out to local WS queues.
+    Auto-reconnects on connection loss; exits cleanly on cancellation.
+    """
+    global _local_cache
+    RECONNECT_DELAY_S = 2.0
+    while True:
+        try:
+            async with _redis_client.pubsub() as pubsub:
+                await pubsub.subscribe(REDIS_CHANNEL)
+                async for msg in pubsub.listen():
+                    if msg["type"] != "message":
+                        continue
+                    data = msg["data"]
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    # Keep local cache fresh for WS initial-snapshot.
+                    _local_cache = data
+                    await _fan_out_local(data)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(RECONNECT_DELAY_S)
+
+
+async def info_exchange_startup() -> None:
+    """Connect to Redis and start the per-worker subscriber task.
+    Falls back silently to single-worker in-process mode if Redis is unavailable.
+    """
+    global _redis_client, _redis_sub_task
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+        await client.ping()
+        _redis_client = client
+        _redis_sub_task = asyncio.create_task(_redis_fan_out_task())
+    except Exception:
+        _redis_client = None  # Redis not reachable — single-worker fallback.
+
+
+async def info_exchange_shutdown() -> None:
+    """Cancel the subscriber task and close the Redis connection cleanly."""
+    global _redis_sub_task, _redis_client
+    if _redis_sub_task:
+        _redis_sub_task.cancel()
+        try:
+            await _redis_sub_task
+        except asyncio.CancelledError:
+            pass
+        _redis_sub_task = None
+    if _redis_client:
+        await _redis_client.aclose()
+        _redis_client = None
