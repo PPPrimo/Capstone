@@ -90,6 +90,10 @@ Running linux tunnel
     sudo systemctl daemon-reload
     sudo systemctl enable cloudflared
     sudo systemctl start cloudflared
+Redis
+sudo apt install redis-server
+sudo systemctl enable redis
+
 
 
 

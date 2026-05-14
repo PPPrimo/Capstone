@@ -180,13 +180,21 @@ async def _load_persisted_history() -> None:
         return
     try:
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(
-            None, lambda: json.loads(_HISTORY_FILE.read_text("utf-8"))
-        )
-        if isinstance(data, list):
-            async with _history_lock:
-                for entry in data[-_MAX_ENTRIES:]:
-                    _stats_history.append(entry)
+        text = await loop.run_in_executor(None, lambda: _HISTORY_FILE.read_text("utf-8"))
+        # Each line is one JSON entry (newest first); reverse so deque is ascending.
+        # Also handle legacy format where a line may be a JSON array.
+        lines = [l for l in text.splitlines() if l.strip()]
+        entries = []
+        for l in lines:
+            parsed = json.loads(l)
+            if isinstance(parsed, list):
+                entries.extend(parsed)   # flatten legacy array lines
+            elif isinstance(parsed, dict):
+                entries.append(parsed)
+        entries.sort(key=lambda e: e.get("t", 0))
+        async with _history_lock:
+            for entry in entries[-_MAX_ENTRIES:]:
+                _stats_history.append(entry)
     except Exception:
         pass  # Corrupt or missing file — start fresh
 
@@ -198,7 +206,9 @@ async def persist_stats_history() -> None:
     if not snapshot:
         return
     try:
-        payload = json.dumps(snapshot, separators=(",", ":"))
+        # One JSON entry per line, newest entry on top
+        lines = [json.dumps(e, separators=(",", ":")) for e in reversed(snapshot)]
+        payload = "\n".join(lines) + "\n"
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, lambda: _HISTORY_FILE.write_text(payload, "utf-8")
@@ -213,7 +223,8 @@ async def stats_collector_task() -> None:
     """
     await _load_persisted_history()
     loop = asyncio.get_running_loop()
-    last_persist = _time.monotonic()
+    # Subtract the interval so the first persist fires on the very first collection cycle
+    last_persist = _time.monotonic() - _PERSIST_INTERVAL_S
     while True:
         try:
             raw = await loop.run_in_executor(None, _collect_stats_sync)

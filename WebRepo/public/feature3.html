@@ -59,7 +59,6 @@
     <div class="history-section">
       <div class="history-header">
         <button id="btnToggleHistory" class="btn-history">Show History</button>
-        <button id="btnClearHistory" class="btn-history btn-history-clear" style="display:none">Clear History</button>
         <div id="rangeWrap" class="range-wrap" style="display:none">
           <label for="rangeSlider" class="range-label" id="rangeLabel">All</label>
           <input id="rangeSlider" type="range" min="0" max="8" value="8" class="range-slider" />
@@ -75,9 +74,7 @@
   <script>
     (function () {
       const POLL_MS = 2000;
-      const STORE_KEY = 'sysHistory';
-      // ~16 MB budget → ~80 000 entries (each ~200 bytes JSON with all fields)
-      const MAX_ENTRIES = 80000;
+      let _cachedHistory = [];
 
       /* ── DOM refs ── */
       const section  = document.getElementById('feature3');
@@ -97,7 +94,6 @@
       const errBox    = document.getElementById('statsError');
 
       const btnToggle   = document.getElementById('btnToggleHistory');
-      const btnClear    = document.getElementById('btnClearHistory');
       const chartsWrap  = document.getElementById('chartsWrap');
       const hInfo       = document.getElementById('historyInfo');
       const rangeWrap   = document.getElementById('rangeWrap');
@@ -141,44 +137,20 @@
         return v.toFixed(1) + ' °C';
       }
 
-      /* ── History (localStorage) ── */
-      function loadHistory() {
-        try { const r = localStorage.getItem(STORE_KEY); return r ? JSON.parse(r) : []; }
-        catch { return []; }
-      }
-      function saveHistory(arr) {
-        if (arr.length > MAX_ENTRIES) arr = arr.slice(arr.length - MAX_ENTRIES);
-        try { localStorage.setItem(STORE_KEY, JSON.stringify(arr)); } catch { /* quota */ }
-        return arr;
-      }
-      function pushEntry(d) {
-        const hist = loadHistory();
-        const entry = {
-          t: Date.now(),
-          cpu: d.cpu_percent,
-          ram: d.ram_percent,
-          ramU: d.ram_used_gb,
-          ramT: d.ram_total_gb,
-          gpu: d.gpu_percent,
-          vram: d.vram_percent,
-          cpuT: d.cpu_temp_c,
-          gpuT: d.gpu_temp_c,
-        };
-        // Store each disk's percent keyed by mountpoint: d_C:\, d_D:\, d_/, …
-        if (d.disks) {
-          for (const dk of d.disks) {
-            entry['d_' + dk.mountpoint] = dk.percent;
-          }
-        }
-        hist.push(entry);
-        return saveHistory(hist);
+      /* ── History (server-side JSON file) ── */
+      async function fetchAndCacheHistory() {
+        const res = await fetch('/api/system-history', { credentials: 'same-origin' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        // Server deque is ascending; sort defensively
+        _cachedHistory = Array.isArray(data) ? data.sort((a, b) => a.t - b.t) : [];
+        return _cachedHistory;
       }
       function updateInfo(hist) {
         if (!hist.length) { hInfo.textContent = ''; return; }
         const spanMs = hist[hist.length - 1].t - hist[0].t;
         const hrs = (spanMs / 3600000).toFixed(1);
-        const kb = (JSON.stringify(hist).length / 1024).toFixed(0);
-        hInfo.textContent = hist.length + ' pts \u00b7 ' + hrs + ' h span \u00b7 ~' + kb + ' KB stored';
+        hInfo.textContent = hist.length + ' pts \u00b7 ' + hrs + ' h span';
       }
 
       /* ── Chart definitions ── */
@@ -388,6 +360,10 @@
       function renderAllCharts(hist) {
         const rows = buildChartRows(hist);
         chartsWrap.innerHTML = '';
+        if (!rows.length) {
+          chartsWrap.innerHTML = '<p style="color:#888;font-size:0.88rem;padding:16px 4px;margin:0">No history yet — data will appear here after the server has been running for a few seconds.</p>';
+          return;
+        }
 
         // Use visualViewport for zoom-aware sizing, fallback to innerHeight
         const viewH = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
@@ -478,33 +454,27 @@
       }
 
       /* ── Toggle / clear ── */
-      btnToggle.addEventListener('click', function () {
+      btnToggle.addEventListener('click', async function () {
         chartVisible = !chartVisible;
         chartsWrap.style.display = chartVisible ? '' : 'none';
-        btnClear.style.display = chartVisible ? '' : 'none';
         rangeWrap.style.display = chartVisible ? '' : 'none';
         btnToggle.textContent = chartVisible ? 'Hide History' : 'Show History';
         section.classList.toggle('compact', chartVisible);
         if (chartVisible) {
-          const h = loadHistory();
-          const fh = filterHistory(h);
+          try {
+            hInfo.textContent = 'Loading\u2026';
+            await fetchAndCacheHistory();
+          } catch (_) { /* use whatever is cached */ }
+          const fh = filterHistory(_cachedHistory);
           updateInfo(fh);
           renderAllCharts(fh);
         }
       });
       rangeSlider.addEventListener('input', function () {
         if (!chartVisible) return;
-        const h = loadHistory();
-        const fh = filterHistory(h);
+        const fh = filterHistory(_cachedHistory);
         updateInfo(fh);
         renderAllCharts(fh);
-      });
-      btnClear.addEventListener('click', function () {
-        if (confirm('Clear all stored history?')) {
-          localStorage.removeItem(STORE_KEY);
-          chartsWrap.innerHTML = '';
-          hInfo.textContent = 'History cleared.';
-        }
       });
 
       /* ── Poll ── */
@@ -518,9 +488,6 @@
           }
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const d = await res.json();
-
-          // Always store history, even when tab is hidden
-          const hist = pushEntry(d);
 
           // Skip UI updates when the tab is not visible
           if (document.hidden) return;
@@ -555,9 +522,9 @@
           // Dynamic disk cards
           updateDiskCards(d.disks);
 
-          // Update charts if visible
+          // Update charts if visible (use cached server history)
           if (chartVisible) {
-            const fh = filterHistory(hist);
+            const fh = filterHistory(_cachedHistory);
             updateInfo(fh);
             renderAllCharts(fh);
           }
@@ -576,35 +543,10 @@
       });
 
       function onResize() {
-        if (chartVisible) renderAllCharts(filterHistory(loadHistory()));
+        if (chartVisible) renderAllCharts(filterHistory(_cachedHistory));
       }
       window.addEventListener('resize', onResize);
       if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
-
-      // On load, pull the server-side history (collected even when this page was closed)
-      // and merge it into localStorage so the chart reflects the full uptime span.
-      async function loadServerHistory() {
-        try {
-          const res = await fetch('/api/system-history', { credentials: 'same-origin' });
-          if (!res.ok) return;
-          const serverEntries = await res.json();
-          if (!Array.isArray(serverEntries) || !serverEntries.length) return;
-          const local = loadHistory();
-          const localTimes = new Set(local.map(e => e.t));
-          const merged = [...local];
-          for (const e of serverEntries) {
-            if (!localTimes.has(e.t)) merged.push(e);
-          }
-          merged.sort((a, b) => a.t - b.t);
-          saveHistory(merged);
-          if (chartVisible) {
-            const fh = filterHistory(loadHistory());
-            updateInfo(fh);
-            renderAllCharts(fh);
-          }
-        } catch (_) { /* non-fatal — local history still works */ }
-      }
-      loadServerHistory();
 
       poll();
       setInterval(poll, POLL_MS);
