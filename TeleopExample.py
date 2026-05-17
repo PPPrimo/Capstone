@@ -103,7 +103,7 @@ def FollowerStream():
 
     asyncio.run(FollowerLoop())
 
-def FollowerAction():
+def FollowerAction(teleop_device):
     global latest_command
     while True:
         print(latest_command)
