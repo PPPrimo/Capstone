@@ -83,42 +83,7 @@ def _read_gpu_nvidia() -> dict:
 async def system_stats(_: User = Depends(current_superuser)):
     """Return current machine health metrics (admin only)."""
     loop = asyncio.get_running_loop()
-    gpu = await loop.run_in_executor(None, _read_gpu_nvidia)
-    cpu_temp = await loop.run_in_executor(None, _read_cpu_temp)
-
-    mem = psutil.virtual_memory()
-
-    # Scan all mounted disks
-    disks = []
-    for part in psutil.disk_partitions(all=False):
-        try:
-            usage = psutil.disk_usage(part.mountpoint)
-            disks.append({
-                "device": part.device,
-                "mountpoint": part.mountpoint,
-                "fstype": part.fstype,
-                "total_gb": round(usage.total / (1024 ** 3), 2),
-                "used_gb": round(usage.used / (1024 ** 3), 2),
-                "free_gb": round(usage.free / (1024 ** 3), 2),
-                "percent": usage.percent,
-            })
-        except (PermissionError, OSError):
-            continue
-
-    return {
-        "cpu_percent": psutil.cpu_percent(interval=0.3),
-        "cpu_temp_c": cpu_temp,
-        "ram_total_gb": round(mem.total / (1024 ** 3), 2),
-        "ram_used_gb": round(mem.used / (1024 ** 3), 2),
-        "ram_percent": mem.percent,
-        "gpu_percent": gpu["gpu_percent"],
-        "gpu_temp_c": gpu["gpu_temp_c"],
-        "gpu_name": gpu["gpu_name"],
-        "vram_used_mb": gpu["vram_used_mb"],
-        "vram_total_mb": gpu["vram_total_mb"],
-        "vram_percent": gpu["vram_percent"],
-        "disks": disks,
-    }
+    return await loop.run_in_executor(None, _collect_stats_sync)
 
 
 def _collect_stats_sync() -> dict:
@@ -182,14 +147,13 @@ async def _load_persisted_history() -> None:
     try:
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(None, lambda: _HISTORY_FILE.read_text("utf-8"))
-        # Each line is one JSON entry (newest first); reverse so deque is ascending.
-        # Also handle legacy format where a line may be a JSON array.
-        lines = [l for l in text.splitlines() if l.strip()]
         entries = []
-        for l in lines:
+        for l in text.splitlines():
+            if not l.strip():
+                continue
             parsed = json.loads(l)
             if isinstance(parsed, list):
-                entries.extend(parsed)   # flatten legacy array lines
+                entries.extend(parsed)  # handle legacy array-per-line format
             elif isinstance(parsed, dict):
                 entries.append(parsed)
         entries.sort(key=lambda e: e.get("t", 0))
@@ -197,18 +161,18 @@ async def _load_persisted_history() -> None:
             for entry in entries[-_MAX_ENTRIES:]:
                 _stats_history.append(entry)
     except Exception:
-        pass  # Corrupt or missing file — start fresh
+        pass  # corrupt or missing — start fresh
 
 
 def _trim_to_size(entries: list) -> list:
     """Drop oldest entries until the serialized payload fits within _MAX_FILE_BYTES."""
-    while entries:
-        lines = [json.dumps(e, separators=(",", ":")) for e in reversed(entries)]
-        size = sum(len(l.encode("utf-8")) + 1 for l in lines)  # +1 for newline
-        if size <= _MAX_FILE_BYTES:
-            break
-        entries = entries[1:]  # drop oldest
-    return entries
+    lines = [json.dumps(e, separators=(",", ":")) for e in entries]
+    size = sum(len(l.encode("utf-8")) + 1 for l in lines)  # +1 per newline
+    i = 0
+    while i < len(lines) and size > _MAX_FILE_BYTES:
+        size -= len(lines[i].encode("utf-8")) + 1
+        i += 1
+    return entries[i:]
 
 
 async def persist_stats_history() -> None:
