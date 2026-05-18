@@ -59,6 +59,7 @@
     <div class="history-section">
       <div class="history-header">
         <button id="btnToggleHistory" class="btn-history">Show History</button>
+        <button id="btnClearHistory" class="btn-history btn-history-clear">Clear History</button>
         <div id="rangeWrap" class="range-wrap" style="display:none">
           <label for="rangeSlider" class="range-label" id="rangeLabel">All</label>
           <input id="rangeSlider" type="range" min="0" max="8" value="8" class="range-slider" />
@@ -74,7 +75,9 @@
   <script>
     (function () {
       const POLL_MS = 2000;
+      const HISTORY_RESYNC_MS = 60_000; // full re-fetch from server every 60 s to stay in sync
       let _cachedHistory = [];
+      let _lastHistoryFetch = 0;
 
       /* ── DOM refs ── */
       const section  = document.getElementById('feature3');
@@ -94,6 +97,7 @@
       const errBox    = document.getElementById('statsError');
 
       const btnToggle   = document.getElementById('btnToggleHistory');
+      const btnClear    = document.getElementById('btnClearHistory');
       const chartsWrap  = document.getElementById('chartsWrap');
       const hInfo       = document.getElementById('historyInfo');
       const rangeWrap   = document.getElementById('rangeWrap');
@@ -145,6 +149,25 @@
         // Server deque is ascending; sort defensively
         _cachedHistory = Array.isArray(data) ? data.sort((a, b) => a.t - b.t) : [];
         return _cachedHistory;
+      }
+
+      /* Convert a live /api/system-stats response into the compact history entry format */
+      function statsToEntry(d) {
+        const entry = {
+          t: Date.now(),
+          cpu: d.cpu_percent,
+          ram: d.ram_percent,
+          ramU: d.ram_used_gb,
+          ramT: d.ram_total_gb,
+          gpu: d.gpu_percent,
+          vram: d.vram_percent,
+          cpuT: d.cpu_temp_c,
+          gpuT: d.gpu_temp_c,
+        };
+        for (const dk of (d.disks || [])) {
+          entry['d_' + dk.mountpoint] = dk.percent;
+        }
+        return entry;
       }
       function updateInfo(hist) {
         if (!hist.length) { hInfo.textContent = ''; return; }
@@ -464,6 +487,7 @@
           try {
             hInfo.textContent = 'Loading\u2026';
             await fetchAndCacheHistory();
+            _lastHistoryFetch = Date.now();
           } catch (_) { /* use whatever is cached */ }
           const fh = filterHistory(_cachedHistory);
           updateInfo(fh);
@@ -475,6 +499,27 @@
         const fh = filterHistory(_cachedHistory);
         updateInfo(fh);
         renderAllCharts(fh);
+      });
+
+      btnClear.addEventListener('click', async function () {
+        if (!confirm('Clear all stats history? This cannot be undone.')) return;
+        try {
+          const res = await fetch('/api/system-history', {
+            method: 'DELETE',
+            credentials: 'same-origin',
+          });
+          if (res.status === 401 || res.status === 403) {
+            alert('Admin access required.');
+            return;
+          }
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          _cachedHistory = [];
+          _lastHistoryFetch = 0; // force full re-sync on next poll
+          hInfo.textContent = 'History cleared.';
+          if (chartVisible) renderAllCharts([]);
+        } catch (e) {
+          alert('Failed to clear history: ' + e.message);
+        }
       });
 
       /* ── Poll ── */
@@ -522,8 +567,16 @@
           // Dynamic disk cards
           updateDiskCards(d.disks);
 
-          // Update charts if visible (use cached server history)
+          // Append live point to local history cache for real-time chart updates
           if (chartVisible) {
+            _cachedHistory.push(statsToEntry(d));
+            // Full server re-sync every 60 s (picks up history from before page load)
+            if (Date.now() - _lastHistoryFetch >= HISTORY_RESYNC_MS) {
+              try {
+                await fetchAndCacheHistory();
+                _lastHistoryFetch = Date.now();
+              } catch (_) { /* keep local data */ }
+            }
             const fh = filterHistory(_cachedHistory);
             updateInfo(fh);
             renderAllCharts(fh);

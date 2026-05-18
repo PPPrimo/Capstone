@@ -76,11 +76,14 @@ async def security_headers_and_methods(request: Request, call_next):
     if path.startswith(("/server/", "/tools/", "/dev_local/")):
         return PlainTextResponse("Forbidden", status_code=403)
 
-    # Allow only safe methods globally; allow POST for login/logout and slave ingest.
+    # Allow only safe methods globally; allow POST for login/logout and slave ingest;
+    # allow DELETE for admin history clear.
     if request.method not in ("GET", "HEAD"):
         if request.method == "POST" and path in ("/auth/jwt/login", "/auth/jwt/logout"):
             pass
         elif request.method == "POST" and path == "/api/ingest":
+            pass
+        elif request.method == "DELETE" and path == "/api/system-history":
             pass
         else:
             return PlainTextResponse("Method Not Allowed", status_code=405)

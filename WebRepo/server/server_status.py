@@ -18,6 +18,7 @@ server_status_router = APIRouter()
 _SENSITIVE_DIR = Path(__file__).resolve().parent / "sensitive"
 _HISTORY_FILE = _SENSITIVE_DIR / "stats_history.json"
 _MAX_ENTRIES = 80_000
+_MAX_FILE_BYTES = 5 * 1024 ** 3  # 5 GB rolling cap on the JSON file
 _COLLECT_INTERVAL_S = 2.0
 _PERSIST_INTERVAL_S = 60.0
 
@@ -199,17 +200,36 @@ async def _load_persisted_history() -> None:
         pass  # Corrupt or missing file — start fresh
 
 
+def _trim_to_size(entries: list) -> list:
+    """Drop oldest entries until the serialized payload fits within _MAX_FILE_BYTES."""
+    while entries:
+        lines = [json.dumps(e, separators=(",", ":")) for e in reversed(entries)]
+        size = sum(len(l.encode("utf-8")) + 1 for l in lines)  # +1 for newline
+        if size <= _MAX_FILE_BYTES:
+            break
+        entries = entries[1:]  # drop oldest
+    return entries
+
+
 async def persist_stats_history() -> None:
-    """Flush the in-memory history deque to disk."""
+    """Flush the in-memory history deque to disk, enforcing the 5 GB rolling cap."""
     async with _history_lock:
         snapshot = list(_stats_history)
     if not snapshot:
         return
     try:
-        # One JSON entry per line, newest entry on top
-        lines = [json.dumps(e, separators=(",", ":")) for e in reversed(snapshot)]
-        payload = "\n".join(lines) + "\n"
         loop = asyncio.get_running_loop()
+        trimmed = await loop.run_in_executor(None, _trim_to_size, snapshot)
+        # Sync the deque if entries were trimmed to keep memory consistent
+        if len(trimmed) < len(snapshot):
+            async with _history_lock:
+                _stats_history.clear()
+                for e in trimmed:
+                    _stats_history.append(e)
+        # One JSON entry per line, newest entry last (ascending) so the browser
+        # always loads the most recent data first after a page reload.
+        lines = [json.dumps(e, separators=(",", ":")) for e in trimmed]
+        payload = "\n".join(lines) + "\n"
         await loop.run_in_executor(
             None, lambda: _HISTORY_FILE.write_text(payload, "utf-8")
         )
@@ -245,3 +265,32 @@ async def system_history(_: User = Depends(current_superuser)):
     """Return the full server-side stats history (admin only)."""
     async with _history_lock:
         return list(_stats_history)
+
+
+@server_status_router.delete("/api/system-history")
+async def clear_system_history(_: User = Depends(current_superuser)):
+    """Clear the in-memory stats history and delete the persisted JSON file (admin only)."""
+    async with _history_lock:
+        _stats_history.clear()
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: _HISTORY_FILE.unlink(missing_ok=True))
+    except Exception:
+        pass
+    # Schedule an immediate collect + persist in the background so the file
+    # and in-memory deque are repopulated without waiting up to 60 s.
+    asyncio.create_task(_collect_and_persist_once())
+    return {"ok": True, "message": "Stats history cleared."}
+
+
+async def _collect_and_persist_once() -> None:
+    """Collect one stats snapshot and persist it to disk immediately."""
+    try:
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, _collect_stats_sync)
+        entry = _raw_to_entry(raw, _time.time() * 1000)
+        async with _history_lock:
+            _stats_history.append(entry)
+        await persist_stats_history()
+    except Exception:
+        pass
