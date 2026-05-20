@@ -40,8 +40,8 @@ async function handleOffer(msg) {
         ch.onmessage = (e) => {
             try {
                 const obj = JSON.parse(e.data);
-                obj.received_at = Date.now() / 1000;   // seconds, matches old server envelope
-                setText(JSON.stringify(obj, null, 2));
+                // Put received_at first so it's visible at the top (body overflow:hidden clips bottom)
+                setText(JSON.stringify({ received_at: Date.now() / 1000, ...obj }, null, 2));
             } catch { /* ignore malformed frames */ }
         };
     };
