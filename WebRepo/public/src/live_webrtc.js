@@ -19,7 +19,7 @@ let pc              = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 let reconnectTimer   = null;
 let shouldReconnect  = true;
-
+let latencyArray     = [];
 // ── Peer connection helpers ─────────────────────────────────────────────────
 
 function closePc() {
@@ -27,6 +27,15 @@ function closePc() {
     try { pc.close(); } catch { /* ignore */ }
     pc = null;
 }
+
+function PushInArray(Array, ArraySize, value) {
+        Array.push(value);
+        if (Array.length>=ArraySize){
+            Array.shift();
+        }
+    return Array
+}
+
 
 async function handleOffer(msg) {
     closePc();
@@ -41,8 +50,15 @@ async function handleOffer(msg) {
             try {
                 const received_at = Date.now() / 1000;
                 const obj = JSON.parse(e.data);
+                const latencyValue = received_at - obj.timestamp;
+                latencyArray = PushInArray(latencyArray, 1000, latencyValue);
+                const avgLatency = latencyArray.reduce((a, b) => a + b, 0) / latencyArray.length;
+                const maxLatency= Math.max(...latencyArray);
+                const minLatency= Math.min(...latencyArray);
                 const data = {
-                    latency: received_at - obj.timestamp,
+                    AverageLatency: avgLatency,
+                    MaximumLatency: maxLatency,
+                    MinimumLatency: minLatency,
                     received_at: received_at,
                     ...obj
                 };
