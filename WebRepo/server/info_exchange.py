@@ -1,18 +1,28 @@
 import asyncio
 import json
+import os
 import uuid as _uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi_users.authentication import JWTStrategy
+import redis.asyncio as redis
 
 from server.auth import _authenticate_slave_api_key
 from server.auth import COOKIE_NAME, JWT_SECRET, COOKIE_MAX_AGE
 
 info_exchange_router = APIRouter()
 
-# ── WebRTC signaling state ──
-_rtc_publisher: dict | None = None           # {"ws": WebSocket, "id": str}
-_rtc_subscribers: dict[str, WebSocket] = {}  # peer_id -> WebSocket
+REDIS_URL       = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+# Every subscriber's worker listens here; publisher's worker publishes here.
+RTC_PUB_CHANNEL = "rtc:to_publisher"
+# Publisher's worker publishes here; each subscriber's worker listens on its own channel.
+RTC_SUB_PREFIX  = "rtc:to_sub:"
+
+_redis_client: redis.Redis | None = None
+
+# In-process fallback state (single-worker / dev without Redis)
+_rtc_publisher: dict | None = None
+_rtc_subscribers: dict[str, WebSocket] = {}
 _rtc_lock = asyncio.Lock()
 
 
@@ -51,6 +61,177 @@ async def _ws_authenticate(websocket: WebSocket) -> bool:
     except Exception:
         return False
 
+# ── Redis relay helpers (multi-worker safe) ──
+
+async def _signal_redis_publisher(websocket: WebSocket, peer_id: str) -> None:
+    """Publisher side: subscribe to RTC_PUB_CHANNEL so messages from subscribers
+    on any worker reach this WebSocket; relay outbound offers to per-subscriber channels."""
+    async with _redis_client.pubsub() as pubsub:
+        await pubsub.subscribe(RTC_PUB_CHANNEL)
+
+        async def _redis_to_ws():
+            async for msg in pubsub.listen():
+                if msg["type"] != "message":
+                    continue
+                data = msg["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                try:
+                    await websocket.send_text(data)
+                except Exception:
+                    return
+
+        relay = asyncio.create_task(_redis_to_ws())
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                msg["from"] = peer_id
+                target_id = msg.get("target")
+                if target_id:
+                    await _redis_client.publish(
+                        f"{RTC_SUB_PREFIX}{target_id}", json.dumps(msg)
+                    )
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            relay.cancel()
+            try:
+                await relay
+            except asyncio.CancelledError:
+                pass
+
+
+async def _signal_redis_subscriber(websocket: WebSocket, peer_id: str) -> None:
+    """Subscriber side: subscribe to its own per-id channel so offers from the
+    publisher on any worker reach this WebSocket; relay answers back to the publisher."""
+    async with _redis_client.pubsub() as pubsub:
+        await pubsub.subscribe(f"{RTC_SUB_PREFIX}{peer_id}")
+
+        # Tell publisher (on whatever worker it landed on) a new subscriber is ready.
+        await _redis_client.publish(
+            RTC_PUB_CHANNEL,
+            json.dumps({"type": "subscriber_ready", "sub_id": peer_id}),
+        )
+
+        async def _redis_to_ws():
+            async for msg in pubsub.listen():
+                if msg["type"] != "message":
+                    continue
+                data = msg["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                try:
+                    await websocket.send_text(data)
+                except Exception:
+                    return
+
+        relay = asyncio.create_task(_redis_to_ws())
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                msg["from"] = peer_id
+                await _redis_client.publish(RTC_PUB_CHANNEL, json.dumps(msg))
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            relay.cancel()
+            try:
+                await relay
+            except asyncio.CancelledError:
+                pass
+            try:
+                await _redis_client.publish(
+                    RTC_PUB_CHANNEL,
+                    json.dumps({"type": "subscriber_left", "sub_id": peer_id}),
+                )
+            except Exception:
+                pass
+
+
+# ── In-process fallback helpers (single-worker / dev without Redis) ──
+
+async def _signal_local_publisher(websocket: WebSocket, peer_id: str) -> None:
+    global _rtc_publisher
+    async with _rtc_lock:
+        _rtc_publisher = {"ws": websocket, "id": peer_id}
+        existing_subs = list(_rtc_subscribers.keys())
+
+    for sub_id in existing_subs:
+        try:
+            await websocket.send_text(
+                json.dumps({"type": "subscriber_ready", "sub_id": sub_id})
+            )
+        except Exception:
+            break
+
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                msg["from"] = peer_id
+                async with _rtc_lock:
+                    target_ws = _rtc_subscribers.get(msg.get("target"))
+                if target_ws:
+                    try:
+                        await target_ws.send_text(json.dumps(msg))
+                    except Exception:
+                        pass
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        async with _rtc_lock:
+            if _rtc_publisher and _rtc_publisher["id"] == peer_id:
+                _rtc_publisher = None
+
+
+async def _signal_local_subscriber(websocket: WebSocket, peer_id: str) -> None:
+    async with _rtc_lock:
+        _rtc_subscribers[peer_id] = websocket
+        pub = _rtc_publisher
+
+    if pub:
+        try:
+            await pub["ws"].send_text(
+                json.dumps({"type": "subscriber_ready", "sub_id": peer_id})
+            )
+        except Exception:
+            pass
+
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                msg["from"] = peer_id
+                async with _rtc_lock:
+                    pub = _rtc_publisher
+                if pub:
+                    try:
+                        await pub["ws"].send_text(json.dumps(msg))
+                    except Exception:
+                        pass
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        async with _rtc_lock:
+            _rtc_subscribers.pop(peer_id, None)
+            pub = _rtc_publisher
+        if pub:
+            try:
+                await pub["ws"].send_text(
+                    json.dumps({"type": "subscriber_left", "sub_id": peer_id})
+                )
+            except Exception:
+                pass
+
+
 # ── WebRTC signaling endpoint ──
 
 @info_exchange_router.websocket("/api/webrtc/signal")
@@ -86,88 +267,34 @@ async def webrtc_signal(websocket: WebSocket):
         return
 
     await websocket.accept()
-    global _rtc_publisher, _rtc_subscribers
 
-    try:
+    if _redis_client is not None:
         if role == "publisher":
-            async with _rtc_lock:
-                _rtc_publisher = {"ws": websocket, "id": peer_id}
-                existing_subs = list(_rtc_subscribers.keys())
+            await _signal_redis_publisher(websocket, peer_id)
+        else:
+            await _signal_redis_subscriber(websocket, peer_id)
+    else:
+        if role == "publisher":
+            await _signal_local_publisher(websocket, peer_id)
+        else:
+            await _signal_local_subscriber(websocket, peer_id)
 
-            # Notify about any subscribers that were waiting before publisher arrived
-            for sub_id in existing_subs:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "subscriber_ready", "sub_id": sub_id})
-                    )
-                except Exception:
-                    break
 
-            # Relay loop: publisher → target subscriber
-            while True:
-                try:
-                    raw = await websocket.receive_text()
-                    msg = json.loads(raw)
-                    msg["from"] = peer_id
-                    target_id = msg.get("target")
-                    async with _rtc_lock:
-                        target_ws = _rtc_subscribers.get(target_id)
-                    if target_ws:
-                        try:
-                            await target_ws.send_text(json.dumps(msg))
-                        except Exception:
-                            pass
-                except WebSocketDisconnect:
-                    break
-                except Exception:
-                    break
+async def info_exchange_startup() -> None:
+    """Connect to Redis. Falls back to in-process mode if Redis is unavailable."""
+    global _redis_client
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+        await client.ping()
+        _redis_client = client
+    except Exception:
+        _redis_client = None
 
-        else:  # subscriber
-            async with _rtc_lock:
-                _rtc_subscribers[peer_id] = websocket
-                pub = _rtc_publisher
 
-            # Notify publisher so it can initiate a new PeerConnection for this subscriber
-            if pub:
-                try:
-                    await pub["ws"].send_text(
-                        json.dumps({"type": "subscriber_ready", "sub_id": peer_id})
-                    )
-                except Exception:
-                    pass
-
-            # Relay loop: subscriber → publisher
-            while True:
-                try:
-                    raw = await websocket.receive_text()
-                    msg = json.loads(raw)
-                    msg["from"] = peer_id
-                    async with _rtc_lock:
-                        pub = _rtc_publisher
-                    if pub:
-                        try:
-                            await pub["ws"].send_text(json.dumps(msg))
-                        except Exception:
-                            pass
-                except WebSocketDisconnect:
-                    break
-                except Exception:
-                    break
-
-    finally:
-        async with _rtc_lock:
-            if role == "publisher":
-                if _rtc_publisher and _rtc_publisher["id"] == peer_id:
-                    _rtc_publisher = None
-            else:
-                _rtc_subscribers.pop(peer_id, None)
-                pub = _rtc_publisher
-        # Tell the publisher to tear down this subscriber's PeerConnection
-        if role == "subscriber" and pub:
-            try:
-                await pub["ws"].send_text(
-                    json.dumps({"type": "subscriber_left", "sub_id": peer_id})
-                )
-            except Exception:
-                pass
+async def info_exchange_shutdown() -> None:
+    """Close the Redis connection cleanly."""
+    global _redis_client
+    if _redis_client:
+        await _redis_client.aclose()
+        _redis_client = None
 
