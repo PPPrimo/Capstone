@@ -231,152 +231,17 @@
         return rows;
       }
 
-      /* ── Generic canvas line chart ── */
-      function drawLineChart(canvas, hist, cfg, chartH) {
-        const H = chartH || 180;
-        if (!hist.length) {
-          // Draw empty placeholder with "N/A" label
-          const dpr = window.devicePixelRatio || 1;
-          const rect = canvas.parentElement.getBoundingClientRect();
-          const W = rect.width;
-          canvas.width = W * dpr;
-          canvas.height = H * dpr;
-          canvas.style.width = W + 'px';
-          canvas.style.height = H + 'px';
-          const ctx = canvas.getContext('2d');
-          ctx.scale(dpr, dpr);
-          ctx.fillStyle = '#fafafa';
-          ctx.fillRect(0, 0, W, H);
-          ctx.fillStyle = '#333';
-          ctx.font = 'bold 11px system-ui, sans-serif';
-          ctx.textAlign = 'left';
-          ctx.fillText(cfg.label, 52, 16);
-          ctx.fillStyle = '#bbb';
-          ctx.font = '14px system-ui, sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText('N/A', W / 2, H / 2 + 5);
-          return;
-        }
-
-        // Check if all values are null for this metric
-        const hasData = hist.some(e => cfg.getValue(e) != null);
-        if (!hasData) {
-          const dpr = window.devicePixelRatio || 1;
-          const rect = canvas.parentElement.getBoundingClientRect();
-          const W = rect.width;
-          canvas.width = W * dpr;
-          canvas.height = H * dpr;
-          canvas.style.width = W + 'px';
-          canvas.style.height = H + 'px';
-          const ctx = canvas.getContext('2d');
-          ctx.scale(dpr, dpr);
-          ctx.fillStyle = '#fafafa';
-          ctx.fillRect(0, 0, W, H);
-          ctx.fillStyle = '#333';
-          ctx.font = 'bold 11px system-ui, sans-serif';
-          ctx.textAlign = 'left';
-          ctx.fillText(cfg.label, 52, 16);
-          ctx.fillStyle = '#bbb';
-          ctx.font = '14px system-ui, sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText('No data available', W / 2, H / 2 + 5);
-          return;
-        }
-
-        const dpr = window.devicePixelRatio || 1;
-        const rect = canvas.parentElement.getBoundingClientRect();
-        const W = rect.width;
-        canvas.width = W * dpr;
-        canvas.height = H * dpr;
-        canvas.style.width = W + 'px';
-        canvas.style.height = H + 'px';
-        const ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
-
-        const PAD_L = 48, PAD_R = 14, PAD_T = 24, PAD_B = 32;
-        const plotW = W - PAD_L - PAD_R;
-        const plotH = H - PAD_T - PAD_B;
-        const yMax = cfg.yMax;
-
-        // bg
-        ctx.fillStyle = '#fafafa';
-        ctx.fillRect(0, 0, W, H);
-
-        // Y grid
-        ctx.strokeStyle = '#e8e8e8';
-        ctx.lineWidth = 1;
-        ctx.font = '10px system-ui, sans-serif';
-        ctx.fillStyle = '#999';
-        ctx.textAlign = 'right';
-        const ySteps = cfg.yMax <= 110 ? 4 : 5;
-        for (let i = 0; i <= ySteps; i++) {
-          const val = (yMax / ySteps) * i;
-          const y = PAD_T + plotH - (val / yMax) * plotH;
-          ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + plotW, y); ctx.stroke();
-          ctx.fillText(Math.round(val) + (cfg.unit === '%' ? '%' : ''), PAD_L - 5, y + 3);
-        }
-
-        // X labels
-        const tMin = hist[0].t, tMax = hist[hist.length - 1].t;
-        const tSpan = tMax - tMin || 1;
-        ctx.textAlign = 'center';
-        ctx.fillStyle = '#999';
-        const ticks = Math.min(5, hist.length);
-        for (let i = 0; i <= ticks; i++) {
-          const ratio = i / ticks;
-          const x = PAD_L + ratio * plotW;
-          const d = new Date(tMin + ratio * tSpan);
-          ctx.fillText(d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0'), x, H - 6);
-        }
-
-        // Line & Fill — break at gaps larger than the expected sample spacing
-        const step = hist.length > 1500 ? Math.floor(hist.length / 1500) : 1;
-        const GAP_THRESH = POLL_MS * step * 1.5;
-
-        // Build segments: arrays of {x, y} split by gaps or null values
-        const segments = [];
-        let seg = [];
-        let prevT = null;
-        for (let i = 0; i < hist.length; i += step) {
-          const v = cfg.getValue(hist[i]);
-          if (v == null) {
-            if (seg.length) { segments.push(seg); seg = []; }
-            prevT = null;
-            continue;
-          }
-          const t = hist[i].t;
-          const x = PAD_L + ((t - tMin) / tSpan) * plotW;
-          const y = PAD_T + plotH - (Math.min(v, yMax) / yMax) * plotH;
-          if (prevT != null && (t - prevT) > GAP_THRESH) {
-            if (seg.length) { segments.push(seg); seg = []; }
-          }
-          seg.push({ x, y });
-          prevT = t;
-        }
-        if (seg.length) segments.push(seg);
-
-        // Draw each segment's stroke and fill independently
-        const baseY = PAD_T + plotH;
-        ctx.strokeStyle = cfg.color.line;
-        ctx.lineWidth = 1.5;
-        ctx.lineJoin = 'round';
-        for (const s of segments) {
-          ctx.beginPath();
-          ctx.moveTo(s[0].x, s[0].y);
-          for (let j = 1; j < s.length; j++) ctx.lineTo(s[j].x, s[j].y);
-          ctx.stroke();
-          ctx.lineTo(s[s.length - 1].x, baseY);
-          ctx.lineTo(s[0].x, baseY);
-          ctx.closePath();
-          ctx.fillStyle = cfg.color.fill;
-          ctx.fill();
-        }
-
-        // Title
-        ctx.fillStyle = '#333';
-        ctx.font = 'bold 11px system-ui, sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText(cfg.label, PAD_L + 4, 16);
+      /* ── Generic canvas line chart — delegates to LineChart utility ── */
+      function drawChart(container, hist, cfg, chartH) {
+        new LineChart(container, {
+          data:   hist.map(e => ({ x: e.t, y: cfg.getValue(e) })),
+          yLabel: cfg.label,
+          yMax:   cfg.yMax,
+          yUnit:  cfg.unit,
+          color:  cfg.color.line,
+          fill:   cfg.color.fill,
+          height: chartH,
+        });
       }
 
       /* ── Build / redraw all charts in rows ── */
@@ -388,42 +253,29 @@
           return;
         }
 
-        // Use visualViewport for zoom-aware sizing, fallback to innerHeight
-        const viewH = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
-        // Measure actual top offset of chartsWrap after clearing
-        const wrapRect = chartsWrap.getBoundingClientRect();
-        const topOffset = wrapRect.top;
-        const rowGap = 14;
-        const totalGaps = (rows.length - 1) * rowGap;
-        const border = rows.length * 2; // 1px border top+bottom per chart-box
-        const available = viewH - topOffset - totalGaps - border - 8; // 8px bottom breathing room
-        const chartH = Math.max(48, Math.floor(available / rows.length));
+        const viewH     = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+        const topOffset = chartsWrap.getBoundingClientRect().top;
+        const chartH    = Math.max(48, Math.floor((viewH - topOffset - (rows.length - 1) * 14 - rows.length * 2 - 8) / rows.length));
 
         for (const [leftCfg, rightCfg] of rows) {
           const row = document.createElement('div');
           row.className = 'charts-row';
           chartsWrap.appendChild(row);
 
-          // Left slot
           if (leftCfg) {
             const box = document.createElement('div');
             box.className = 'chart-box';
-            const cvs = document.createElement('canvas');
-            box.appendChild(cvs);
             row.appendChild(box);
-            drawLineChart(cvs, hist, leftCfg, chartH);
+            drawChart(box, hist, leftCfg, chartH);
           } else {
             row.appendChild(document.createElement('div'));
           }
 
-          // Right slot
           if (rightCfg) {
             const box = document.createElement('div');
             box.className = 'chart-box';
-            const cvs = document.createElement('canvas');
-            box.appendChild(cvs);
             row.appendChild(box);
-            drawLineChart(cvs, hist, rightCfg, chartH);
+            drawChart(box, hist, rightCfg, chartH);
           } else {
             row.appendChild(document.createElement('div'));
           }
@@ -605,6 +457,7 @@
       setInterval(poll, POLL_MS);
     })();
   </script>
+  <script src="./assets/linechart.js"></script>
   <script src="./assets/read_only.js?v=20251222"></script>
 </body>
 </html>

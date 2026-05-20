@@ -18,7 +18,7 @@ from server.auth import auth_backend, cookie_transport, current_active_user, cur
 from server.db import create_db_and_tables, get_async_session
 from server.models import User
 from server.server_status import server_status_router, stats_collector_task, persist_stats_history
-from server.info_exchange import info_exchange_router, info_exchange_startup, info_exchange_shutdown
+from server.info_exchange import info_exchange_router
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 PUBLIC_DIR = WORKSPACE_DIR / "public"
@@ -37,13 +37,11 @@ APP_ENV = os.getenv("APP_ENV", "development").lower()
 async def on_startup():
     global _collector_task
     await create_db_and_tables()
-    await info_exchange_startup()
     _collector_task = asyncio.create_task(stats_collector_task())
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global _collector_task
-    await info_exchange_shutdown()
     if _collector_task:
         _collector_task.cancel()
         try:
@@ -80,8 +78,6 @@ async def security_headers_and_methods(request: Request, call_next):
     # allow DELETE for admin history clear.
     if request.method not in ("GET", "HEAD"):
         if request.method == "POST" and path in ("/auth/jwt/login", "/auth/jwt/logout"):
-            pass
-        elif request.method == "POST" and path == "/api/ingest":
             pass
         elif request.method == "DELETE" and path == "/api/system-history":
             pass
