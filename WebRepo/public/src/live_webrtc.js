@@ -39,9 +39,14 @@ async function handleOffer(msg) {
         ch.onclose   = () => setText('DataChannel closed. Waiting for reconnect...');
         ch.onmessage = (e) => {
             try {
+                const received_at = Date.now() / 1000;
                 const obj = JSON.parse(e.data);
-                // Put received_at first so it's visible at the top (body overflow:hidden clips bottom)
-                setText(JSON.stringify({ received_at: Date.now() / 1000, ...obj }, null, 2));
+                const data = {
+                    latency: received_at - obj.timestamp,
+                    received_at: received_at,
+                    ...obj
+                };
+                setText(JSON.stringify(data, null, 2));
             } catch { /* ignore malformed frames */ }
         };
     };
