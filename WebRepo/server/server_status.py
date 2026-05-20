@@ -1,10 +1,12 @@
 import asyncio
 import collections
 import json
+import os
 import shutil
 import subprocess
 import time as _time
 import psutil
+import redis.asyncio as redis
 
 from pathlib import Path
 from fastapi import APIRouter, Depends
@@ -13,6 +15,15 @@ from server.auth import current_superuser
 from server.models import User
 
 server_status_router = APIRouter()
+
+# ── Redis (shared across workers) ──
+REDIS_URL        = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+REDIS_HIST_KEY   = "stats:history"    # ZSET: score=timestamp_ms, member=json entry
+REDIS_LEADER_KEY = "stats:leader"     # STRING with TTL — held by the collector worker
+_LEADER_TTL_S    = 6                  # lock expires if not renewed within this window
+_LEADER_RENEW_S  = 2                  # renewal interval (must be < _LEADER_TTL_S)
+
+_redis_stats: redis.Redis | None = None
 
 # ── Background stats collection ──
 _SENSITIVE_DIR = Path(__file__).resolve().parent / "sensitive"
@@ -141,7 +152,9 @@ def _raw_to_entry(raw: dict, t_ms: float) -> dict:
 
 
 async def _load_persisted_history() -> None:
-    """Load previously persisted history from disk into the in-memory deque on startup."""
+    """Load previously persisted history from disk into the in-memory deque on startup.
+    In Redis mode also seeds the ZSET if it is empty.
+    """
     if not _HISTORY_FILE.exists():
         return
     try:
@@ -153,13 +166,24 @@ async def _load_persisted_history() -> None:
                 continue
             parsed = json.loads(l)
             if isinstance(parsed, list):
-                entries.extend(parsed)  # handle legacy array-per-line format
+                entries.extend(parsed)
             elif isinstance(parsed, dict):
                 entries.append(parsed)
         entries.sort(key=lambda e: e.get("t", 0))
         async with _history_lock:
             for entry in entries[-_MAX_ENTRIES:]:
                 _stats_history.append(entry)
+        # Seed Redis ZSET if empty
+        if _redis_stats is not None:
+            try:
+                if await _redis_stats.zcard(REDIS_HIST_KEY) == 0 and entries:
+                    mapping = {
+                        json.dumps(e, separators=(",", ":")): e["t"]
+                        for e in entries[-_MAX_ENTRIES:]
+                    }
+                    await _redis_stats.zadd(REDIS_HIST_KEY, mapping)
+            except Exception:
+                pass
     except Exception:
         pass  # corrupt or missing — start fresh
 
@@ -176,24 +200,33 @@ def _trim_to_size(entries: list) -> list:
 
 
 async def persist_stats_history() -> None:
-    """Flush the in-memory history deque to disk, enforcing the 5 GB rolling cap."""
-    async with _history_lock:
-        snapshot = list(_stats_history)
+    """Flush history to disk. In Redis mode reads the shared ZSET so all workers
+    write consistent data (last-writer-wins is fine — it's the same content).
+    """
+    try:
+        if _redis_stats is not None:
+            raw = await _redis_stats.zrange(REDIS_HIST_KEY, 0, -1)
+            snapshot = [json.loads(e) for e in raw]
+        else:
+            async with _history_lock:
+                snapshot = list(_stats_history)
+    except Exception:
+        async with _history_lock:
+            snapshot = list(_stats_history)
+
     if not snapshot:
         return
     try:
         loop = asyncio.get_running_loop()
         trimmed = await loop.run_in_executor(None, _trim_to_size, snapshot)
-        # Sync the deque if entries were trimmed to keep memory consistent
-        if len(trimmed) < len(snapshot):
+        if _redis_stats is None and len(trimmed) < len(snapshot):
             async with _history_lock:
                 _stats_history.clear()
                 for e in trimmed:
                     _stats_history.append(e)
-        # One JSON entry per line, newest entry last (ascending) so the browser
-        # always loads the most recent data first after a page reload.
         lines = [json.dumps(e, separators=(",", ":")) for e in trimmed]
         payload = "\n".join(lines) + "\n"
+        _SENSITIVE_DIR.mkdir(parents=True, exist_ok=True)
         await loop.run_in_executor(
             None, lambda: _HISTORY_FILE.write_text(payload, "utf-8")
         )
@@ -203,30 +236,96 @@ async def persist_stats_history() -> None:
 
 async def stats_collector_task() -> None:
     """Background task: sample system stats every 2 s and persist to disk every 60 s.
-    Runs for as long as the server is up — independent of any browser connection.
+
+    Multi-worker safety: uses Redis leader-election so exactly one worker collects
+    at a time.  If Redis is unavailable (dev / single-worker), all code paths fall
+    back to the original in-process behaviour.
     """
+    is_leader = False
+    renew_task: asyncio.Task | None = None
+
+    # ── Leader election (Redis mode) ──
+    if _redis_stats is not None:
+        while True:
+            try:
+                acquired = await _redis_stats.set(
+                    REDIS_LEADER_KEY, "1", nx=True, ex=_LEADER_TTL_S
+                )
+            except Exception:
+                acquired = None
+            if acquired:
+                is_leader = True
+                break
+            # Not the leader — wait one TTL window and retry so we take over
+            # quickly if the current leader's worker dies.
+            await asyncio.sleep(_LEADER_TTL_S)
+
+        # Periodically renew the leadership lease
+        async def _renew_leader() -> None:
+            while True:
+                await asyncio.sleep(_LEADER_RENEW_S)
+                try:
+                    await _redis_stats.expire(REDIS_LEADER_KEY, _LEADER_TTL_S)
+                except Exception:
+                    pass
+
+        renew_task = asyncio.create_task(_renew_leader())
+    else:
+        is_leader = True  # single-worker / no Redis — always collect
+
     await _load_persisted_history()
     loop = asyncio.get_running_loop()
-    # Subtract the interval so the first persist fires on the very first collection cycle
     last_persist = _time.monotonic() - _PERSIST_INTERVAL_S
-    while True:
-        try:
-            raw = await loop.run_in_executor(None, _collect_stats_sync)
-            entry = _raw_to_entry(raw, _time.time() * 1000)
-            async with _history_lock:
-                _stats_history.append(entry)
-        except Exception:
-            pass
-        now = _time.monotonic()
-        if now - last_persist >= _PERSIST_INTERVAL_S:
-            await persist_stats_history()
-            last_persist = now
-        await asyncio.sleep(_COLLECT_INTERVAL_S)
+
+    try:
+        while True:
+            try:
+                raw = await loop.run_in_executor(None, _collect_stats_sync)
+                t_ms = _time.time() * 1000
+                entry = _raw_to_entry(raw, t_ms)
+                async with _history_lock:
+                    _stats_history.append(entry)
+                if _redis_stats is not None:
+                    try:
+                        entry_json = json.dumps(entry, separators=(",", ":"))
+                        await _redis_stats.zadd(REDIS_HIST_KEY, {entry_json: t_ms})
+                        excess = await _redis_stats.zcard(REDIS_HIST_KEY) - _MAX_ENTRIES
+                        if excess > 0:
+                            await _redis_stats.zremrangebyrank(REDIS_HIST_KEY, 0, excess - 1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            now = _time.monotonic()
+            if now - last_persist >= _PERSIST_INTERVAL_S:
+                await persist_stats_history()
+                last_persist = now
+
+            await asyncio.sleep(_COLLECT_INTERVAL_S)
+    finally:
+        if renew_task is not None:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+        if _redis_stats is not None and is_leader:
+            try:
+                await _redis_stats.delete(REDIS_LEADER_KEY)
+            except Exception:
+                pass
 
 
 @server_status_router.get("/api/system-history")
 async def system_history(_: User = Depends(current_superuser)):
     """Return the full server-side stats history (admin only)."""
+    if _redis_stats is not None:
+        try:
+            raw = await _redis_stats.zrange(REDIS_HIST_KEY, 0, -1)
+            return [json.loads(e) for e in raw]
+        except Exception:
+            pass
     async with _history_lock:
         return list(_stats_history)
 
@@ -236,13 +335,16 @@ async def clear_system_history(_: User = Depends(current_superuser)):
     """Clear the in-memory stats history and delete the persisted JSON file (admin only)."""
     async with _history_lock:
         _stats_history.clear()
+    if _redis_stats is not None:
+        try:
+            await _redis_stats.delete(REDIS_HIST_KEY)
+        except Exception:
+            pass
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: _HISTORY_FILE.unlink(missing_ok=True))
     except Exception:
         pass
-    # Schedule an immediate collect + persist in the background so the file
-    # and in-memory deque are repopulated without waiting up to 60 s.
     asyncio.create_task(_collect_and_persist_once())
     return {"ok": True, "message": "Stats history cleared."}
 
@@ -252,9 +354,38 @@ async def _collect_and_persist_once() -> None:
     try:
         loop = asyncio.get_running_loop()
         raw = await loop.run_in_executor(None, _collect_stats_sync)
-        entry = _raw_to_entry(raw, _time.time() * 1000)
+        t_ms = _time.time() * 1000
+        entry = _raw_to_entry(raw, t_ms)
         async with _history_lock:
             _stats_history.append(entry)
+        if _redis_stats is not None:
+            try:
+                entry_json = json.dumps(entry, separators=(",", ":"))
+                await _redis_stats.zadd(REDIS_HIST_KEY, {entry_json: t_ms})
+            except Exception:
+                pass
         await persist_stats_history()
     except Exception:
         pass
+
+
+async def stats_startup() -> None:
+    """Connect to Redis. Falls back silently to single-worker in-process mode."""
+    global _redis_stats
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+        await client.ping()
+        _redis_stats = client
+    except Exception:
+        _redis_stats = None
+
+
+async def stats_shutdown() -> None:
+    """Close the Redis connection cleanly."""
+    global _redis_stats
+    if _redis_stats is not None:
+        try:
+            await _redis_stats.aclose()
+        except Exception:
+            pass
+        _redis_stats = None

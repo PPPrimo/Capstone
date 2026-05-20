@@ -17,7 +17,7 @@ from sqlalchemy import select
 from server.auth import auth_backend, cookie_transport, current_active_user, current_optional_user, current_superuser, fastapi_users
 from server.db import create_db_and_tables, get_async_session
 from server.models import User
-from server.server_status import server_status_router, stats_collector_task, persist_stats_history
+from server.server_status import server_status_router, stats_collector_task, persist_stats_history, stats_startup, stats_shutdown
 from server.info_exchange import info_exchange_router, info_exchange_startup, info_exchange_shutdown
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +37,7 @@ APP_ENV = os.getenv("APP_ENV", "development").lower()
 async def on_startup():
     global _collector_task
     await create_db_and_tables()
+    await stats_startup()
     await info_exchange_startup()
     _collector_task = asyncio.create_task(stats_collector_task())
 
@@ -51,6 +52,7 @@ async def on_shutdown():
         except asyncio.CancelledError:
             pass
     await persist_stats_history()
+    await stats_shutdown()
 
 # Framework-managed auth routes:
 # - POST /auth/jwt/login
