@@ -12,11 +12,15 @@ from server.auth import COOKIE_NAME, JWT_SECRET, COOKIE_MAX_AGE
 
 info_exchange_router = APIRouter()
 
-REDIS_URL       = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+REDIS_URL            = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 # Every subscriber's worker listens here; publisher's worker publishes here.
-RTC_PUB_CHANNEL = "rtc:to_publisher"
+RTC_PUB_CHANNEL      = "rtc:to_publisher"
 # Publisher's worker publishes here; each subscriber's worker listens on its own channel.
-RTC_SUB_PREFIX  = "rtc:to_sub:"
+RTC_SUB_PREFIX       = "rtc:to_sub:"
+# Durable SET of subscriber peer_ids currently waiting for an offer.
+# Survives Redis pub/sub fire-and-forget so a late publisher can catch up.
+REDIS_PENDING_SUBS   = "rtc:pending_subs"
+REDIS_PENDING_SUB_TTL = 3600  # seconds; auto-expire stale entries after 1 h
 
 _redis_client: redis.Redis | None = None
 
@@ -69,6 +73,22 @@ async def _signal_redis_publisher(websocket: WebSocket, peer_id: str) -> None:
     async with _redis_client.pubsub() as pubsub:
         await pubsub.subscribe(RTC_PUB_CHANNEL)
 
+        # Catch any subscribers that arrived before the publisher connected.
+        # They registered in REDIS_PENDING_SUBS; re-send subscriber_ready for each.
+        try:
+            pending = await _redis_client.smembers(REDIS_PENDING_SUBS)
+            for sub_id in pending:
+                if isinstance(sub_id, bytes):
+                    sub_id = sub_id.decode("utf-8")
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "subscriber_ready", "sub_id": sub_id})
+                    )
+                except Exception:
+                    break
+        except Exception:
+            pass
+
         async def _redis_to_ws():
             async for msg in pubsub.listen():
                 if msg["type"] != "message":
@@ -108,6 +128,14 @@ async def _signal_redis_subscriber(websocket: WebSocket, peer_id: str) -> None:
     async with _redis_client.pubsub() as pubsub:
         await pubsub.subscribe(f"{RTC_SUB_PREFIX}{peer_id}")
 
+        # Register in the durable pending set BEFORE publishing subscriber_ready so
+        # a publisher that connects later will find this subscriber in the set.
+        try:
+            await _redis_client.sadd(REDIS_PENDING_SUBS, peer_id)
+            await _redis_client.expire(REDIS_PENDING_SUBS, REDIS_PENDING_SUB_TTL)
+        except Exception:
+            pass
+
         # Tell publisher (on whatever worker it landed on) a new subscriber is ready.
         await _redis_client.publish(
             RTC_PUB_CHANNEL,
@@ -140,6 +168,11 @@ async def _signal_redis_subscriber(websocket: WebSocket, peer_id: str) -> None:
             try:
                 await relay
             except asyncio.CancelledError:
+                pass
+            # Remove from pending set so the publisher won't re-offer a dead subscriber.
+            try:
+                await _redis_client.srem(REDIS_PENDING_SUBS, peer_id)
+            except Exception:
                 pass
             try:
                 await _redis_client.publish(
