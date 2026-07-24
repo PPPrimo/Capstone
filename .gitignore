@@ -6,8 +6,11 @@
 /venv/
 /.vscode/
 /ResearchFiles
+/3DPrintFiles/stl
+/3DPrintFiles/old files
 # Optional: common Python/OS noise (kept minimal)
 __pycache__/
 *.py[cod]
 .DS_Store
 Thumbs.db
+

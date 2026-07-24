@@ -14,25 +14,25 @@ import asyncio
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 
-motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
-base_url = os.getenv("PUBLISH_URL", "https://primowang.com/").rstrip("/")
-#base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
 
+
+
+"""Global Variables"""
+motorId = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']
+teleop_device = None
+
+base_url = os.getenv("PUBLISH_URL", "https://primowang.com/").rstrip("/")
 api_key = "uapi_dc1ab5d444.bxAGSutbbRAuAM8gPw4Hj5AiCPBEdfKbxoczrki0ak4"
+#base_url = os.getenv("PUBLISH_URL", "http://127.0.0.1:8000").rstrip("/")
 #api_key = "uapi_8139a97701.5VLxX7OxnZ2thJNQM26tnNQJahKWsGane9WMQW_OIhQ"
 
 latest_command = None
 command_lock = threading.Lock()
-
-teleop_device = None
 payload = None
 ExcutionPeriod = 0.01
-# robot_config = SO101FollowerConfig(
-#     port="/dev/tty.usbmodem58760431541",
-#     id="Primo",
-# )
-# robot = SO101Follower(robot_config)
-# robot.connect()
+_post_payload = None
+_post_lock = threading.Lock()
+"""Global Variables End"""
 
 def get_all_states(device) -> dict[str, dict]:
     """Read position, velocity, and current for all motors.
@@ -53,9 +53,6 @@ def get_all_states(device) -> dict[str, dict]:
         }
     }
 
-_post_payload = None
-_post_lock = threading.Lock()
-
 # ── WebRTC publisher (low-latency path) ──────────────────────────────────────
 
 _STUN = RTCConfiguration(
@@ -69,8 +66,7 @@ _webrtc_signal_url = (
 
 async def _webrtc_publisher_async():
     """Connect to the signaling server, create one RTCPeerConnection per browser
-    subscriber, and stream motor telemetry over an unreliable/unordered DataChannel
-    (UDP semantics — always delivers the latest frame, never blocks on retransmit).
+    subscriber, and stream motor telemetry over an unordered DataChannel
     """
     peers: dict[str, dict] = {}  # sub_id -> {"pc": RTCPeerConnection, "channel": channel}
 
@@ -244,35 +240,85 @@ async def _webrtc_follower_async():
 def webrtc_follower_thread():
     asyncio.run(_webrtc_follower_async())
 
-def FollowerAction(teleop_device):
-    global latest_command
-    while True:
-        print(latest_command)
-        time.sleep(0.1)
+def sync_states_to_follower(device, states: dict):
+    """Convert a get_all_states() payload received over WebRTC into a
+    RobotAction dict and send it to the follower arm."""
+    if states is None or "motors" not in states:
+        return
+    action = {f"{motor}.pos": data["position"] for motor, data in states["motors"].items()}
+    device.send_action(action)
 
+def FollowerRecieve(teleop_device):
+    with command_lock:
+        states = latest_command
+    if states is not None:
+        sync_states_to_follower(teleop_device, states)
 
 def main():
     global ExcutionPeriod
-    parser = argparse.ArgumentParser()
+    global teleop_device
 
+    ### Input
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--type",
         type=str,
         required=True,
-        help="Mode type (e.g., Follower or Leader)"
+        help="Mode type --type(e.g., Follower or Leader)"
     )
+
+    parser.add_argument(
+        "--COM",
+        type=str,
+        required=True,
+        help="COM Port --COM(e.g COM2...)"
+    )
+
     args = parser.parse_args()
+
+
     if args.type == "Follower":
+        print("entered")
+        teleop_config = SO101FollowerConfig(
+            port=args.COM,
+            id="PrimoFollower",
+        )
+        teleop_device = SO101Follower(teleop_config)
+        teleop_device.connect()
+
+        def _recieve_loop():
+            while True:
+                try:
+                    FollowerRecieve(teleop_device)
+                except Exception as exc:
+                    print("FollowerRecieve error:", exc)
+                time.sleep(ExcutionPeriod)  # 10 ms read interval
+        send_thread = threading.Thread(target=_recieve_loop, daemon=True)
+        send_thread.start()
         recieve_thread = threading.Thread(target=webrtc_follower_thread, daemon=True)
         recieve_thread.start()
-        FollowerAction()
+
+        ### Ploting feature
+        set_role("follower")
+        set_realtime_plot(False)        
+        set_layout(rows=6, cols=2)  # 12 series (6 motors × pos+current) in 2 rows of 6
+        while True:
+            with command_lock:
+                states = latest_command
+            if states is not None:
+                t = time.time()
+                for m in motorId:
+                    log_and_plot(t, states["motors"][m]["position"], "time", "position", f"{m}_position")
+                    log_and_plot(t, states["motors"][m]["velocity"], "time", "velocity", f"{m}_velocity")
+                    #log_and_plot(t, states["motors"][m]["current"],  "time", "current",  f"{m}_current")
+                flush_plot()
+            time.sleep(ExcutionPeriod)
 
     elif args.type == "Leader":
         teleop_config = SO101LeaderConfig(
-            port="COM9",
-            id="Primo",
+            port=args.COM,
+            id="PrimoLeader",
         )
-        global teleop_device
         teleop_device = SO101Leader(teleop_config)
         teleop_device.connect()
         def _send_loop():
@@ -287,7 +333,8 @@ def main():
         send_thread.start()
         webrtc_thread = threading.Thread(target=webrtc_publisher_thread, daemon=True)
         webrtc_thread.start()
-        # plot() must run on the main thread (Windows matplotlib requirement)        
+
+        ### Ploting feature
         set_role("leader")
         set_realtime_plot(False)        
         set_layout(rows=6, cols=2)  # 12 series (6 motors × pos+current) in 2 rows of 6
