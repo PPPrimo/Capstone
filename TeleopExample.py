@@ -1,5 +1,5 @@
-from lerobot.teleoperators.so_leader import SO101LeaderConfig, SO101Leader
-from lerobot.robots.so_follower import SO101FollowerConfig, SO101Follower
+from RobotFiles.Drivers.LeaderArm import LeaderTeleopConfig, Leader
+from RobotFiles.Drivers.FollowerArm import FollowerRobotConfig, Follower
 
 from WebRepo.server.plot_logger import log_and_plot, flush_plot, set_layout, set_role, set_realtime_plot, plot_json
 
@@ -279,11 +279,11 @@ def main():
 
     if args.type == "Follower":
         print("entered")
-        teleop_config = SO101FollowerConfig(
+        teleop_config = FollowerRobotConfig(
             port=args.COM,
             id="PrimoFollower",
         )
-        teleop_device = SO101Follower(teleop_config)
+        teleop_device = Follower(teleop_config)
         teleop_device.connect()
 
         def _recieve_loop():
@@ -293,8 +293,7 @@ def main():
                 except Exception as exc:
                     print("FollowerRecieve error:", exc)
                 time.sleep(ExcutionPeriod)  # 10 ms read interval
-        send_thread = threading.Thread(target=_recieve_loop, daemon=True)
-        send_thread.start()
+
         recieve_thread = threading.Thread(target=webrtc_follower_thread, daemon=True)
         recieve_thread.start()
 
@@ -315,11 +314,11 @@ def main():
             time.sleep(ExcutionPeriod)
 
     elif args.type == "Leader":
-        teleop_config = SO101LeaderConfig(
+        teleop_config = LeaderTeleopConfig(
             port=args.COM,
             id="PrimoLeader",
         )
-        teleop_device = SO101Leader(teleop_config)
+        teleop_device = Leader(teleop_config)
         teleop_device.connect()
         def _send_loop():
             while True:
