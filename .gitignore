@@ -8,6 +8,7 @@
 /ResearchFiles
 /3DPrintFiles/stl
 /3DPrintFiles/old files
+/lerobot - legacy
 # Optional: common Python/OS noise (kept minimal)
 __pycache__/
 *.py[cod]
